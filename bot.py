@@ -23,7 +23,7 @@ threading.Thread(target=start_web_server, daemon=True).start()
 # --- THÔNG TIN CẤU HÌNH GẮN TRỰC TIẾP ---
 API_ID = 36437338
 API_HASH = "18d34c7efc396d277f3db62baa078efc"
-BOT_TOKEN = "8194497853:AAG6fdLREzWaNLq9oHWOCfqYiUm-avveefA"
+BOT_TOKEN = "8575442769:AAFjKX3fSXzHW9oYllRRbFeR2KxVe_czfq8"
 ADMIN_ID = 7816353760
 
 bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
