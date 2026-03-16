@@ -105,6 +105,11 @@ tg_app = Application.builder().token(CONFIG["bot_token"]).build()
 # ==========================================================
 #                      WEBHOOK SEPAY (NHẬN BILL)
 # ==========================================================
+@app.get("/")
+async def health_check():
+    """Endpoint giúp treo bot trên Render không bị sleep"""
+    return {"status": "online", "timestamp": datetime.now().isoformat()}
+
 @app.post("/webhook")
 async def sepay_webhook(request: Request):
     try:
@@ -205,7 +210,7 @@ async def cmd_taogdtg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         amount = int(re.sub(r"\D", "", parts[0]))
         product = parts[1]
-        seller = parts[2] # Có thể là @username hoặc tên
+        seller = parts[2] 
         
         if amount < 1000:
             return await update.message.reply_text("❌ Số tiền tối thiểu là 1,000 VND!")
@@ -253,9 +258,7 @@ async def cmd_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not trade:
         return await update.message.reply_text("❌ Không tìm thấy mã giao dịch này!")
 
-    # PHÂN QUYỀN: Chỉ người được @ (seller_name) mới được dùng /bank
     curr_user = f"@{update.effective_user.username}"
-    # So khớp handle hoặc user_id nếu có lưu (ở đây so khớp handle từ lúc tạo đơn)
     if curr_user.lower() != trade['seller_name'].lower():
         return await update.message.reply_text(f"⛔ Quyền hạn: Chỉ người bán (<b>{trade['seller_name']}</b>) mới có quyền rút tiền đơn này!", parse_mode=ParseMode.HTML)
 
@@ -292,7 +295,6 @@ async def cmd_huy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     curr_user = f"@{update.effective_user.username}".lower()
     
-    # Chỉ người mua hoặc người bán mới được hủy khi đang chờ tiền
     if user_id == trade['buyer_id'] or curr_user == trade['seller_name'].lower():
         if trade['status'] == Status.PENDING:
             db.update_trade(code, status=Status.CANCELLED)
@@ -352,22 +354,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("done_"):
         code = data.split("_")[1]
         trade = db.get_trade(code)
-        if not trade or user_id != trade['buyer_id']:
+        if not trade: return await query.answer("❌ Đơn không tồn tại!")
+        if user_id != trade['buyer_id']:
             return await query.answer("⛔ Chỉ người mua mới được xác nhận nhận hàng!", show_alert=True)
         
-        db.update_trade(code, status=Status.BUYER_DONE)
-        await query.answer("✅ Đã xác nhận! Chờ người bán rút tiền.", show_alert=True)
-        txt = f"<b>📦 GIAO DỊCH {code} HOÀN TẤT</b>\n\nNgười bán {trade['seller_name']} vui lòng rút tiền bằng cú pháp:\n<code>/bank {code} [STK Bank Tên]</code>"
-        if query.message.photo: await query.edit_message_caption(caption=txt, parse_mode=ParseMode.HTML)
-        else: await query.edit_message_text(text=txt, parse_mode=ParseMode.HTML)
+        if trade['status'] == Status.HOLDING:
+            db.update_trade(code, status=Status.BUYER_DONE)
+            await query.answer("✅ Đã xác nhận! Chờ người bán rút tiền.", show_alert=True)
+            txt = f"<b>📦 GIAO DỊCH {code} HOÀN TẤT</b>\n\nNgười bán {trade['seller_name']} vui lòng rút tiền bằng cú pháp:\n<code>/bank {code} [STK Bank Tên]</code>"
+            if query.message.photo: await query.edit_message_caption(caption=txt, parse_mode=ParseMode.HTML)
+            else: await query.edit_message_text(text=txt, parse_mode=ParseMode.HTML)
+        else:
+            await query.answer("⚠️ Trạng thái đơn không hợp lệ!", show_alert=True)
 
     elif data.startswith("adminpayout_"):
         if user_id != CONFIG['admin_id']: return
         code = data.split("_")[1]
         trade = db.get_trade(code)
-        db.update_trade(code, status=Status.COMPLETED)
-        await query.edit_message_text(f"✅ Đã giải ngân thành công đơn {code}")
-        await context.bot.send_message(trade['group_id'], f"<b>🎉 CHÚC MỪNG! GIAO DỊCH {code} ĐÃ HOÀN TẤT 100%</b>\nCảm ơn các bạn đã sử dụng dịch vụ trung gian uy tín.", parse_mode=ParseMode.HTML)
+        if trade['status'] == Status.PAYOUT_WAIT:
+            db.update_trade(code, status=Status.COMPLETED)
+            await query.edit_message_text(f"✅ Đã giải ngân thành công đơn {code}")
+            await context.bot.send_message(trade['group_id'], f"<b>🎉 CHÚC MỪNG! GIAO DỊCH {code} ĐÃ HOÀN TẤT 100%</b>\nCảm ơn các bạn đã sử dụng dịch vụ trung gian uy tín.", parse_mode=ParseMode.HTML)
+        else:
+            await query.answer("⚠️ Đơn này đã được xử lý trước đó.")
 
 # ==========================================================
 #                      RUNNER
@@ -382,18 +391,25 @@ async def main_runner():
     tg_app.add_handler(CommandHandler("thongke", cmd_thongke))
     tg_app.add_handler(CallbackQueryHandler(callback_handler))
     
+    # Khởi tạo bot
     await tg_app.initialize()
     await tg_app.start()
     
-    # Chạy Polling cho Telegram
+    # Chạy Polling cho Telegram trong background
     asyncio.create_task(tg_app.updater.start_polling())
+    logger.info("🤖 Bot Telegram is running...")
     
     # Chạy Webhook Server (FastAPI)
-    port = int(os.environ.get("PORT", 10000))
+    # Cấu hình port cho Render hoặc Replit
+    port = int(os.environ.get("PORT", 8080)) 
     config = uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio")
     server = uvicorn.Server(config)
+    
+    logger.info(f"🌐 Webhook Server running on port {port}")
     await server.serve()
 
 if __name__ == "__main__":
-    asyncio.run(main_runner())
-                  
+    try:
+        asyncio.run(main_runner())
+    except KeyboardInterrupt:
+        pass
