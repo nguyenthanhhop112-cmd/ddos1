@@ -218,7 +218,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 Thống Kê Giao Dịch", callback_data="ui_stats"), InlineKeyboardButton("👨‍💻 Admin", url=f"https://t.me/{CONFIG['admin_handle'][1:]}")]
     ]
     
-    txt = f"""<b>🌟 HỆ THỐNG TRUNG GIAN TỰ ĐỘNG PRO MAX 🌟</b>
+    txt = f"""<b>🌟 HỆ THỐNG TRUNG GIAN TỰ ĐỘNG 🌟</b>
 ━━━━━━━━━━━━━━━━━━━━
 Chào mừng bạn đến với nền tảng Giao Dịch An Toàn, Nhanh Chóng và Tự Động 100%.
 
@@ -261,11 +261,9 @@ async def cmd_taogdtg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         code = f"GD{int(datetime.now().timestamp())}"
         
-        # Gọi hàm tính phí mới chuẩn 100%
         fee = calculate_fee(amount)
         total = amount + fee
 
-        # Lấy link nhóm để Admin dễ check, nếu bot chưa có quyền thì để trống
         try: group_link = await update.effective_chat.export_invite_link()
         except: group_link = "Chưa cấp quyền Admin cho Bot"
 
@@ -311,7 +309,6 @@ async def cmd_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not trade:
         return await update.message.reply_text("❌ Không tìm thấy mã giao dịch này!")
 
-    # PHÂN QUYỀN: Chỉ người được @ (seller_name) mới được dùng /bank
     curr_user = f"@{update.effective_user.username}"
     if curr_user.lower() != trade['seller_name'].lower():
         return await update.message.reply_text(f"⛔ Quyền hạn: Chỉ người bán (<b>{trade['seller_name']}</b>) mới có quyền rút tiền đơn này!", parse_mode=ParseMode.HTML)
@@ -321,7 +318,6 @@ async def cmd_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.log_action(code, "YÊU CẦU RÚT", f"Bank: {info}")
         kb = [[InlineKeyboardButton("✅ XÁC NHẬN ĐÃ GIẢI NGÂN", callback_data=f"adminpayout_{code}")]]
         
-        # Tin nhắn xịn cho Admin
         admin_txt = f"""🏛 <b>YÊU CẦU RÚT TIỀN: {code}</b>
 ━━━━━━━━━━━━━━━━━━━━
 💰 <b>Số tiền cần chuyển:</b> {trade['amount']:,} VND
@@ -364,14 +360,13 @@ async def cmd_huy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     curr_user = f"@{update.effective_user.username}".lower()
     
-    # Chỉ người mua hoặc người bán mới được hủy khi đang chờ tiền
     if user_id == trade['buyer_id'] or curr_user == trade['seller_name'].lower():
         if trade['status'] == Status.PENDING:
             db.update_trade(code, status=Status.CANCELLED)
             db.log_action(code, "HỦY ĐƠN", f"Bởi user_id: {user_id}")
             await update.message.reply_text(f"✅ Đã hủy giao dịch {code} thành công!")
         else:
-            await update.message.reply_text("❌ Chỉ có thể hủy khi đơn đang ở trạng thái CHỜ THANH TOÁN (Bot chưa nhận được tiền)!")
+            await update.message.reply_text("❌ Chỉ có thể hủy khi đơn đang ở trạng thái CHỜ THANH TOÁN!")
     else:
         await update.message.reply_text("⛔ Bạn không có quyền hủy đơn này!")
 
@@ -396,25 +391,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ━━━━━━━━━━━━━━━━━━━━
 1️⃣ <b>Tạo đơn:</b> Trong nhóm gõ lệnh:
 👉 <code>/taogdtg Tiền | Sản phẩm | @UsernameNgườiBán</code>
-<i>(Ví dụ: /taogdtg 150000 | Nick Vip | @admin)</i>
 
-2️⃣ <b>Thanh toán:</b> Người mua Quét mã QR chuyển tiền cho Bot kèm đúng nội dung (Mã GD).
+2️⃣ <b>Thanh toán:</b> Người mua Quét mã QR chuyển tiền cho Bot kèm nội dung Mã GD.
 
-3️⃣ <b>Giao hàng:</b> Bot báo ĐÃ NHẬN TIỀN -> Người bán tiến hành giao acc/hàng hóa.
+3️⃣ <b>Giao hàng:</b> Bot báo ĐÃ NHẬN TIỀN -> Người bán tiến hành giao hàng.
 
-4️⃣ <b>Xác nhận:</b> Người mua kiểm tra hàng Ok xong bấm nút <b>[✅ TÔI ĐÃ NHẬN ĐỦ HÀNG]</b> trên nhóm.
+4️⃣ <b>Xác nhận:</b> Người mua nhận hàng xong bấm nút <b>[✅ TÔI ĐÃ NHẬN ĐỦ HÀNG]</b>.
 
-5️⃣ <b>Rút tiền:</b> Người bán gõ lệnh để rút tiền về Bank:
-👉 <code>/bank [Mã GD] [STK - Tên Bank - Tên Chủ]</code>"""
-        
-        kb = [
-            [InlineKeyboardButton("🔙 Quay Lại Menu Chính", callback_data="ui_back")]
-        ]
+5️⃣ <b>Rút tiền:</b> Người bán dùng <code>/bank</code> để yêu cầu giải ngân."""
+        kb = [[InlineKeyboardButton("🔙 Quay Lại Menu Chính", callback_data="ui_back")]]
         await query.edit_message_text(txt, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
 
     elif data == "ui_stats":
         s = db.get_stats()
-        txt = f"<b>📊 THỐNG KÊ CHUNG HỆ THỐNG</b>\n━━━━━━━━━━━━━━━━━━━━\n✅ Tổng số giao dịch thành công toàn mạng lưới: {s['total_count'] or 0} đơn"
+        txt = f"<b>📊 THỐNG KÊ CHUNG HỆ THỐNG</b>\n━━━━━━━━━━━━━━━━━━━━\n✅ Tổng số giao dịch thành công: {s['total_count'] or 0} đơn"
         kb = [[InlineKeyboardButton("🔙 Quay Lại Menu Chính", callback_data="ui_back")]]
         await query.edit_message_text(txt, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
 
@@ -435,4 +425,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if trade and (user_id == trade['buyer_id'] or username.lower() == trade['seller_name'].lower()):
             if trade['status'] == Status.PENDING:
                 db.update_trade(code, status=Status.CANCELLED)
-                db.log_action(code, "HỦY ĐƠN", f"Hủy qua nút bởi
+                db.log_action(code, "HỦY ĐƠN", f"Hủy qua nút bởi {username}")
+                if query.message.photo: await query.edit_message_caption("❌ <b>GIAO DỊCH NÀY ĐÃ ĐƯỢC HỦY</b>", parse_mode=ParseMode.HTML)
+                else: await query.edit_message_text("❌ <b>GIAO DỊCH NÀY ĐÃ ĐƯỢC HỦY</b>", parse_mode=ParseMode.HTML)
+            else: await query.answer("❌ Không thể hủy đơn lúc này!", show_alert=True)
+        else: await query.answer("⛔ Bạn không có quyền!", show_alert=True)
+
+    elif data.startswith("done_"):
+        code = dat
