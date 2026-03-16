@@ -2,4 +2,3 @@ python-telegram-bot
 fastapi
 uvicorn
 pydantic
-requests
