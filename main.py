@@ -99,8 +99,8 @@ async def sepay_webhook(request: Request):
     try:
         data = await request.json()
         content = data.get("content", "").upper()
-        # Đây là số tiền khách vừa chuyển trong cái bill này
-        amount_in = int(data.get("amount_in", 0))
+        # Chuyển đổi amount_in sang kiểu int để so sánh chính xác
+        amount_in = int(float(data.get("amount_in", 0)))
         
         match = re.search(r"GD(\d+)", content)
         if match:
@@ -118,9 +118,9 @@ async def process_paid_invoice(code, amount_received):
     if not trade or trade['status'] != Status.PENDING:
         return
 
-    # SO SÁNH: Tiền bill nạp vào vs Tiền cần thanh toán của đơn
-    if amount_received >= trade['total_pay']:
-        # CHUYỂN ĐỦ HOẶC DƯ -> VÀO VIỆC
+    # CHỈ CẦN LỚN HƠN HOẶC BẰNG LÀ DUYỆT (BẤT KỂ DƯ BAO NHIÊU)
+    if int(amount_received) >= int(trade['total_pay']):
+        # CẬP NHẬT TRẠNG THÁI TRƯỚC ĐỂ TRÁNH DOUBLE BILL
         db.update_trade(code, status=Status.HOLDING)
         
         try: await tg_app.bot.unpin_chat_message(chat_id=trade['group_id'], message_id=trade['qr_msg_id'])
@@ -142,7 +142,7 @@ async def process_paid_invoice(code, amount_received):
         db.update_trade(code, status_msg_id=sent.message_id)
         await tg_app.bot.pin_chat_message(chat_id=trade['group_id'], message_id=sent.message_id)
     else:
-        # CHUYỂN THIẾU -> BÁO LỖI
+        # CHỈ BÁO THIẾU KHI THỰC SỰ NHỎ HƠN SỐ TIỀN CẦN THÀNH TOÁN
         missing = trade['total_pay'] - amount_received
         txt = f"""<b>⚠️ CẢNH BÁO: CHUYỂN THIẾU TIỀN</b>
 ━━━━━━━━━━━━━━━━━━━━
@@ -271,4 +271,4 @@ async def main_runner():
 
 if __name__ == "__main__":
     asyncio.run(main_runner())
-                                        
+        
