@@ -303,22 +303,35 @@ async def admin_pay_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_callback_handler(update, context)
 
 # ==========================================================
-#                      KHỞI CHẠY
+#                      KHỞI CHẠY (FIXED)
 # ==========================================================
-async def run_bot():
+async def main():
+    # 1. Đăng ký các handler
     telegram_app.add_handler(CommandHandler("start", start_cmd))
     telegram_app.add_handler(CommandHandler("taogdtg", create_trade_cmd))
     telegram_app.add_handler(CommandHandler("done", done_cmd))
     telegram_app.add_handler(CommandHandler("bank", bank_cmd))
     telegram_app.add_handler(CallbackQueryHandler(admin_pay_handler))
 
+    # 2. Khởi tạo Telegram App
     await telegram_app.initialize()
     await telegram_app.start()
-    await telegram_app.updater.start_polling()
+    
+    # Chạy polling (nhận tin nhắn) trong một task riêng
+    asyncio.create_task(telegram_app.updater.start_polling())
+
+    # 3. Chạy Web Server (FastAPI) để nhận Webhook SePay
+    port = int(os.environ.get("PORT", 10000))
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio")
+    server = uvicorn.Server(config)
+    
+    # serve() là một coroutine, nó sẽ giữ cho loop chạy mãi mãi
+    await server.serve()
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.create_task(run_bot())
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    try:
+        # Sử dụng asyncio.run() - Cách duy nhất đúng chuẩn cho Python 3.10+
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
     
