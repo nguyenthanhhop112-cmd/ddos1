@@ -39,7 +39,8 @@ CONFIG = {
     "fee_percent": 0.01
 }
 
-DB_FILE = "system_v11.sqlite3" # Đổi tên DB để làm mới hoàn toàn, tránh kẹt dữ liệu cũ
+# Sử dụng DB bản V13 để đảm bảo cấu trúc dữ liệu mới nhất
+DB_FILE = "system_v13.sqlite3"
 
 class Status:
     PENDING = "CHO_THANH_TOAN"
@@ -62,12 +63,22 @@ class Database:
         with self.conn:
             self.conn.execute('''CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT UNIQUE, group_id INTEGER, group_name TEXT,
-                buyer_id INTEGER, buyer_name TEXT, buyer_user TEXT,
-                seller_id INTEGER, seller_name TEXT, 
-                amount INTEGER, fee INTEGER, total_pay INTEGER,
-                product_name TEXT, seller_bank_info TEXT, status TEXT, 
-                qr_msg_id INTEGER, status_msg_id INTEGER, created_at TEXT)''')
+                code TEXT UNIQUE, 
+                group_id INTEGER, 
+                group_name TEXT,
+                buyer_id INTEGER, 
+                buyer_name TEXT, 
+                buyer_user TEXT,
+                seller_name TEXT, 
+                amount INTEGER, 
+                fee INTEGER, 
+                total_pay INTEGER,
+                product_name TEXT, 
+                seller_bank_info TEXT, 
+                status TEXT, 
+                qr_msg_id INTEGER, 
+                status_msg_id INTEGER, 
+                created_at TEXT)''')
 
     def create_trade(self, data):
         with self.conn:
@@ -93,7 +104,7 @@ app = FastAPI()
 tg_app = Application.builder().token(CONFIG["bot_token"]).build()
 
 # ==========================================================
-#                      WEBHOOK SEPAY (NHẬN TIỀN TỰ ĐỘNG)
+#                      WEBHOOK SEPAY (NHẬN TIỀN)
 # ==========================================================
 @app.post("/webhook")
 async def sepay_webhook(request: Request):
@@ -101,110 +112,102 @@ async def sepay_webhook(request: Request):
         data = await request.json()
         content = data.get("content", "").upper()
         amount_in = int(data.get("amount_in", 0))
-        logger.info(f"WEBHOOK BẮN VỀ: Nội dung='{content}' | Tiền={amount_in}")
         
-        # Bắt chính xác mã GD, bất chấp khoảng trắng hay rác phía sau
-        match = re.search(r"GD\d+", content)
-        if match and amount_in > 0:
-            code = match.group()
-            asyncio.create_task(process_paid_invoice(code, amount_in))
+        # Regex thông minh để bắt mã đơn GDxxxx giữa các ký tự khác
+        match = re.search(r"GD(\d+)", content)
+        if match:
+            trade_code = f"GD{match.group(1)}"
+            logger.info(f"🔔 PHÁT HIỆN BILL: {trade_code} | Số tiền: {amount_in}")
+            # Đưa vào hàng chờ xử lý để phản hồi Webhook 200 OK ngay lập tức
+            asyncio.create_task(process_paid_invoice(trade_code, amount_in))
         
         return {"status": "success"}
     except Exception as e:
-        logger.error(f"Lỗi Webhook Crash: {e}")
+        logger.error(f"❌ Lỗi Webhook: {e}")
         return {"status": "error"}
 
 async def process_paid_invoice(code, amount):
+    # Lấy thông tin đơn hàng từ DB để biết đơn này của NHÓM NÀO (group_id)
     trade = db.get_trade(code)
     
-    # Bỏ qua nếu không có đơn này hoặc đơn đã qua bước nhận tiền
-    if not trade or trade['status'] != Status.PENDING:
+    if not trade:
+        logger.warning(f"⚠️ Nhận bill {code} nhưng không tìm thấy đơn trong Database.")
         return
 
-    # LOGIC CHẶT CHẼ BÁO LỖI THIẾU TIỀN RÕ RÀNG VÀO ĐÚNG GROUP
+    # Chỉ xử lý nếu đơn đang ở trạng thái chờ thanh toán
+    if trade['status'] != Status.PENDING:
+        logger.info(f"ℹ️ Đơn {code} đã được xử lý trước đó (Trạng thái: {trade['status']}).")
+        return
+
+    group_id = trade['group_id']
+
+    # Kiểm tra số tiền khách chuyển
     if amount < trade['total_pay']:
-        thieu = trade['total_pay'] - amount
-        msg_error = f"""<b>⚠️ CẢNH BÁO: CHUYỂN THIẾU TIỀN ĐƠN {code}</b>
+        missing = trade['total_pay'] - amount
+        msg_error = f"""<b>⚠️ CẢNH BÁO: CHUYỂN THIẾU TIỀN</b>
 ━━━━━━━━━━━━━━━━━━━━
-📦 <b>Sản phẩm:</b> {trade['product_name']}
-💰 <b>Tổng cần thanh toán (Bao gồm phí):</b> <code>{trade['total_pay']:,}</code> VND
-📥 <b>Hệ thống thực nhận:</b> <code>{amount:,}</code> VND
-❌ <b>SỐ TIỀN CÒN THIẾU:</b> <code>{thieu:,}</code> VND
+🆔 <b>Mã đơn:</b> <code>{code}</code>
+💰 <b>Cần thanh toán:</b> <code>{trade['total_pay']:,}</code> VND
+📥 <b>Thực nhận:</b> <code>{amount:,}</code> VND
+❌ <b>CÒN THIẾU:</b> <code>{missing:,}</code> VND
 
 👤 <b>Người mua:</b> {trade['buyer_name']}
-⚠️ <i>Vui lòng chuyển khoản thêm đúng số tiền còn thiếu với nội dung <code>{code}</code> để hệ thống tự động chốt đơn! Giao dịch đang bị tạm giữ.</i>"""
-        try:
-            await tg_app.bot.send_message(chat_id=trade['group_id'], text=msg_error, parse_mode=ParseMode.HTML)
-        except Exception as e:
-            logger.error(f"Lỗi gửi tin báo thiếu tiền vào group {trade['group_id']}: {e}")
+⚠️ <i>Vui lòng chuyển thêm đúng số tiền thiếu với nội dung <code>{code}</code> để hệ thống tự động xác nhận!</i>"""
+        await tg_app.bot.send_message(chat_id=group_id, text=msg_error, parse_mode=ParseMode.HTML)
         return
 
-    # LOGIC NHẬN ĐỦ TIỀN - CHUYỂN TRẠNG THÁI HOLDING
+    # CẬP NHẬT TRẠNG THÁI: BOT ĐÃ GIỮ TIỀN
     db.update_trade(code, status=Status.HOLDING)
     
-    # Cố gắng gỡ ghim mã QR cũ cho đỡ rác nhóm
+    # Gỡ ghim mã QR cũ
     try:
-        await tg_app.bot.unpin_chat_message(chat_id=trade['group_id'], message_id=trade['qr_msg_id'])
+        await tg_app.bot.unpin_chat_message(chat_id=group_id, message_id=trade['qr_msg_id'])
     except: pass
 
-    # In ra thông báo nhận đủ tiền và tạo nút xác nhận cho người mua
-    msg_success = f"""<b>✅ GIAO DỊCH {code} ĐÃ NHẬN ĐỦ TIỀN</b>
+    # Thông báo nhận đủ tiền cho NHÓM CỤ THỂ
+    msg_success = f"""<b>✅ HỆ THỐNG ĐÃ NHẬN ĐỦ TIỀN {code}</b>
 ━━━━━━━━━━━━━━━━━━━━
 📦 <b>Sản phẩm:</b> {trade['product_name']}
-💰 <b>Số tiền hệ thống nhận:</b> {amount:,} VND
+💰 <b>Số tiền nhận:</b> {amount:,} VND
 🛡 <b>Trạng thái:</b> BOT ĐANG GIỮ TIỀN AN TOÀN
 
 👤 <b>Người mua:</b> {trade['buyer_name']}
 👤 <b>Người bán:</b> {trade['seller_name']}
 ━━━━━━━━━━━━━━━━━━━━
-🚀 <b>YÊU CẦU:</b> Mời người bán tiến hành giao hàng cho người mua.
-⚠️ <i>LƯU Ý QUAN TRỌNG: Chỉ khi nào người mua nhận đủ hàng, hãy bấm nút XÁC NHẬN bên dưới để Admin tiến hành giải ngân!</i>"""
+🚀 <b>YÊU CẦU:</b> Người bán hãy giao hàng cho người mua ngay.
+⚠️ <b>GHI CHÚ:</b> Sau khi nhận đủ hàng, người mua <b>PHẢI</b> bấm nút xác nhận dưới đây."""
 
-    btn = [[InlineKeyboardButton("✅ TÔI ĐÃ NHẬN ĐỦ HÀNG (Người mua bấm)", callback_data=f"done_{code}")]]
+    btn = [[InlineKeyboardButton("✅ TÔI ĐÃ NHẬN ĐỦ HÀNG", callback_data=f"done_{code}")]]
     
     try:
         sent_msg = await tg_app.bot.send_message(
-            chat_id=trade['group_id'], 
+            chat_id=group_id, 
             text=msg_success, 
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(btn)
         )
         db.update_trade(code, status_msg_id=sent_msg.message_id)
-        # Ghim tin nhắn trạng thái mới lên để mọi người thấy
-        await tg_app.bot.pin_chat_message(chat_id=trade['group_id'], message_id=sent_msg.message_id)
+        await tg_app.bot.pin_chat_message(chat_id=group_id, message_id=sent_msg.message_id)
     except Exception as e:
-        logger.error(f"Lỗi khi gửi thông báo thành công vào group {trade['group_id']}: {e}")
+        logger.error(f"❌ Lỗi gửi tin vào nhóm {group_id}: {e}")
 
 # ==========================================================
-#                      BOT COMMANDS & GIAO DIỆN
+#                      BOT COMMANDS
 # ==========================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot_info = await context.bot.get_me()
-    keyboard = [
-        [InlineKeyboardButton("➕ Thêm Bot Vào Nhóm Giao Dịch", url=f"https://t.me/{bot_info.username}?startgroup=true")],
-        [InlineKeyboardButton("📖 Hướng Dẫn Sử Dụng", callback_data="ui_help")],
-        [InlineKeyboardButton("👨‍💻 Liên Hệ Admin Đội Ngũ", url=f"https://t.me/{CONFIG['admin_handle'][1:]}")]
+    kb = [
+        [InlineKeyboardButton("➕ Thêm Bot Vào Nhóm", url=f"https://t.me/{(await context.bot.get_me()).username}?startgroup=true")],
+        [InlineKeyboardButton("👨‍💻 Admin", url=f"https://t.me/{CONFIG['admin_handle'][1:]}")]
     ]
-    
-    txt = f"""<b>⚡ HỆ THỐNG TRUNG GIAN TỰ ĐỘNG CAO CẤP</b>
-━━━━━━━━━━━━━━━━━━━━
-Chào mừng bạn đến với nền tảng Giao Dịch Trung Gian an toàn tuyệt đối.
-
-<b>💎 TÍNH NĂNG NỔI BẬT:</b>
-• Tự động nhận diện thanh toán Bank chỉ trong 3 giây.
-• Bot giữ tiền an toàn tuyệt đối cho người mua.
-• Giải ngân siêu tốc cho người bán.
-• Tránh 100% rủi ro lừa đảo (Scam).
-
-<i>Sử dụng các nút bên dưới để khám phá hệ thống!</i>"""
-    await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
+    txt = "<b>⚡ HỆ THỐNG TRUNG GIAN AUTO V13</b>\nBot tự động nhận diện thanh toán và bảo vệ giao dịch đa nhóm."
+    await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
 async def cmd_taogdtg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Chỉ cho phép tạo GD trong nhóm
     if update.effective_chat.type == "private":
-        return await update.message.reply_text("❌ Lệnh này chỉ hoạt động trong Nhóm Giao Dịch!")
+        return await update.message.reply_text("❌ Lệnh này chỉ dùng trong Nhóm Giao Dịch!")
     
     try:
+        # Tách lệnh: /taogdtg 100000 | Nick game | @seller
         text = update.message.text.replace("/taogdtg", "").strip()
         parts = [p.strip() for p in text.split("|")]
         if len(parts) < 3: raise ValueError()
@@ -213,183 +216,123 @@ async def cmd_taogdtg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         product = parts[1]
         seller = parts[2]
         
+        # Tạo mã đơn duy nhất kèm timestamp
         code = f"GD{int(datetime.now().timestamp())}"
-        # Logic tính phí
         fee = max(CONFIG['fee_min'], int(amount * CONFIG['fee_percent']))
         total = amount + fee
 
-        # Lưu thẳng ID của cái nhóm vừa gõ lệnh để sau này Webhook bắn về đúng nhóm đó
+        # LƯU THÔNG TIN NHÓM VÀ NGƯỜI DÙNG VÀO DB
         db.create_trade({
-            "code": code, "group_id": update.effective_chat.id, "group_name": update.effective_chat.title,
-            "buyer_id": update.effective_user.id, "buyer_name": update.effective_user.full_name,
-            "buyer_user": f"@{update.effective_user.username}", "seller_name": seller,
+            "code": code, 
+            "group_id": update.effective_chat.id, 
+            "group_name": update.effective_chat.title,
+            "buyer_id": update.effective_user.id, 
+            "buyer_name": update.effective_user.full_name,
+            "buyer_user": f"@{update.effective_user.username}", 
+            "seller_name": seller,
             "amount": amount, "fee": fee, "total_pay": total, "product_name": product
         })
 
         qr_url = f"https://img.vietqr.io/image/{CONFIG['bank_bin']}-{CONFIG['bank_stk']}-compact2.png?amount={total}&addInfo={code}&accountName={CONFIG['bank_owner'].replace(' ', '%20')}"
         
-        txt = f"""<b>🤝 YÊU CẦU GIAO DỊCH TRUNG GIAN</b>
+        txt = f"""<b>🤝 GIAO DỊCH TRUNG GIAN MỚI</b>
 ━━━━━━━━━━━━━━━━━━━━
-🆔 <b>Mã giao dịch:</b> <code>{code}</code>
+🆔 <b>Mã đơn:</b> <code>{code}</code>
 📦 <b>Sản phẩm:</b> {product}
 👤 <b>Người bán:</b> {seller}
 👤 <b>Người mua:</b> {update.effective_user.full_name}
 ━━━━━━━━━━━━━━━━━━━━
-💵 <b>Giá trị SP:</b> {amount:,} VND
-⚙️ <b>Phí trung gian:</b> {fee:,} VND
-💳 <b>TỔNG CẦN THANH TOÁN:</b> <code>{total:,}</code> VND
-📝 <b>NỘI DUNG CHUYỂN KHOẢN:</b> <code>{code}</code>
+💵 <b>Giá trị:</b> {amount:,} VND
+⚙️ <b>Phí:</b> {fee:,} VND
+💳 <b>TỔNG THANH TOÁN:</b> <code>{total:,}</code> VND
+📝 <b>NỘI DUNG CK:</b> <code>{code}</code>
 
-⚠️ <i>Vui lòng quét mã QR hoặc chuyển khoản đúng số tiền và nội dung. Hệ thống sẽ tự động xác nhận trong 3s-5s!</i>"""
+⚠️ <i>Vui lòng chuyển đúng số tiền và nội dung. Hệ thống tự động xác nhận trong 3s!</i>"""
 
         msg = await update.message.reply_photo(photo=qr_url, caption=txt, parse_mode=ParseMode.HTML)
         db.update_trade(code, qr_msg_id=msg.message_id)
-        # Tự động ghim QR code
         try: await msg.pin() 
         except: pass
         
-    except Exception:
-        await update.message.reply_text("<b>❌ SAI CÚ PHÁP TẠO ĐƠN!</b>\n👉 <b>Mẫu chuẩn:</b> <code>/taogdtg Số_tiền | Tên_sản_phẩm | @Nguoi_ban</code>", parse_mode=ParseMode.HTML)
+    except:
+        await update.message.reply_text("❌ <b>Sai cú pháp!</b>\n👉 <code>/taogdtg Số_tiền | Tên_SP | @Người_bán</code>", parse_mode=ParseMode.HTML)
 
-# ==========================================================
-#                      LOGIC NÚT BẤM (ANTI-TREO)
-# ==========================================================
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
     user_id = update.effective_user.id
 
-    try:
-        # LOGIC NÚT 1: NGƯỜI MUA XÁC NHẬN ĐÃ NHẬN HÀNG
-        if data.startswith("done_"):
-            code = data.split("_")[1]
-            trade = db.get_trade(code)
+    if data.startswith("done_"):
+        code = data.split("_")[1]
+        trade = db.get_trade(code)
+        
+        if not trade: return await query.answer("❌ Đơn không tồn tại!")
+        if user_id != trade['buyer_id']:
+            return await query.answer("⛔ Chỉ người mua mới được xác nhận!", show_alert=True)
             
-            if not trade:
-                return await query.answer("❌ Đơn hàng này không còn tồn tại trong hệ thống!", show_alert=True)
-            
-            # Cấm người ngoài bấm linh tinh
-            if user_id != trade['buyer_id']:
-                return await query.answer("⛔ CHỈ NGƯỜI MUA CHÍNH CHỦ MỚI ĐƯỢC BẤM NÚT NÀY!", show_alert=True)
-                
-            if trade['status'] != Status.HOLDING:
-                return await query.answer("⚠️ Giao dịch này đã được xác nhận hoặc đã kết thúc rồi!", show_alert=True)
+        if trade['status'] != Status.HOLDING:
+            return await query.answer("⚠️ Trạng thái đơn không hợp lệ!")
 
-            # Xử lý thành công, chuyển sang bước yêu cầu Bank
-            db.update_trade(code, status=Status.BUYER_DONE)
-            await query.answer("✅ XÁC NHẬN THÀNH CÔNG! Đang gọi người bán...")
-            
-            # Gỡ ghim tin nhắn yêu cầu chờ hàng
-            try: await context.bot.unpin_chat_message(chat_id=trade['group_id'], message_id=trade['status_msg_id'])
-            except: pass
-            
-            txt_done = f"""<b>📦 XÁC NHẬN NHẬN HÀNG THÀNH CÔNG</b>
+        db.update_trade(code, status=Status.BUYER_DONE)
+        await query.answer("✅ Xác nhận thành công!")
+        
+        # Cập nhật thông báo trong nhóm
+        txt_done = f"""<b>📦 XÁC NHẬN HOÀN TẤT GIAO HÀNG</b>
 ━━━━━━━━━━━━━━━━━━━━
 🆔 <b>Mã đơn:</b> <code>{code}</code>
-✅ Người mua đã xác nhận nhận đầy đủ sản phẩm.
+✅ Người mua đã nhận đủ hàng.
 
-<b>🔔 BƯỚC CUỐI - NHẬN TIỀN (Dành cho người bán):</b>
-Mời người bán {trade['seller_name']} gửi thông tin ngân hàng để Admin giải ngân.
-👉 <b>Người bán gõ lệnh theo cú pháp:</b>
-<code>/bank {code} Số_tài_khoản Tên_ngân_hàng Tên_chủ_thẻ</code>"""
+🔔 <b>Người bán {trade['seller_name']} dùng lệnh rút tiền:</b>
+<code>/bank {code} STK Tên_Bank Chủ_TK</code>"""
+        
+        if query.message.photo:
+            await query.edit_message_caption(caption=txt_done, parse_mode=ParseMode.HTML)
+        else:
+            await query.edit_message_text(text=txt_done, parse_mode=ParseMode.HTML)
+
+    elif data.startswith("adminpayout_"):
+        if user_id != CONFIG['admin_id']: return
+        code = data.split("_")[1]
+        trade = db.get_trade(code)
+        
+        if trade and trade['status'] == Status.PAYOUT_WAIT:
+            db.update_trade(code, status=Status.COMPLETED)
+            await query.answer("✅ Đã chốt đơn!")
+            await query.edit_message_text(f"✅ Đã giải ngân thành công đơn <code>{code}</code>", parse_mode=ParseMode.HTML)
             
-            if query.message.photo:
-                await query.edit_message_caption(caption=txt_done, parse_mode=ParseMode.HTML)
-            else:
-                await query.edit_message_text(text=txt_done, parse_mode=ParseMode.HTML)
-
-        # LOGIC NÚT 2: ADMIN XÁC NHẬN ĐÃ GIẢI NGÂN
-        elif data.startswith("adminpayout_"):
-            if user_id != CONFIG['admin_id']:
-                return await query.answer("⛔ Bạn không phải là Admin! Tránh ra!", show_alert=True)
-            
-            code = data.split("_")[1]
-            trade = db.get_trade(code)
-            
-            if trade and trade['status'] == Status.PAYOUT_WAIT:
-                db.update_trade(code, status=Status.COMPLETED)
-                await query.answer("✅ ĐÃ CHỐT ĐƠN & GỬI THÔNG BÁO VÀO NHÓM!")
-                
-                # Cập nhật tin nhắn trong DM của Admin
-                txt_admin = f"✅ <b>ĐÃ GIẢI NGÂN THÀNH CÔNG CHO ĐƠN:</b> <code>{code}</code>"
-                await query.edit_message_text(text=txt_admin, parse_mode=ParseMode.HTML)
-                
-                # Bắn thông báo chốt đơn về đúng Nhóm GD ban đầu
-                txt_group = f"""<b>🎉 GIAO DỊCH HOÀN TẤT TUYỆT ĐỐI</b>
-━━━━━━━━━━━━━━━━━━━━
-🆔 <b>Mã đơn:</b> <code>{code}</code>
-📦 <b>Sản phẩm:</b> {trade['product_name']}
-💸 Admin đã giải ngân thành công số tiền <code>{trade['amount']:,}</code> VND cho người bán.
-
-🤝 Cảm ơn các bạn đã tin tưởng sử dụng dịch vụ trung gian của chúng tôi!"""
-                await context.bot.send_message(chat_id=trade['group_id'], text=txt_group, parse_mode=ParseMode.HTML)
-
-        # UI HƯỚNG DẪN Ở MENU START
-        elif data == "ui_help":
-            await query.answer()
-            txt_help = f"""<b>📖 HƯỚNG DẪN QUY TRÌNH TRUNG GIAN</b>
-━━━━━━━━━━━━━━━━━━━━
-<b>Bước 1:</b> Tại nhóm GD, gửi lệnh tạo đơn:
-<code>/taogdtg Số_tiền | Sản_phẩm | @Nguoi_ban</code>
-<b>Bước 2:</b> Người mua quét mã QR thanh toán (Hệ thống tự động báo nhận tiền trong 3s).
-<b>Bước 3:</b> Người bán tiến hành giao hàng cho người mua.
-<b>Bước 4:</b> Nhận đủ hàng, Người mua nhấn nút <b>"Tôi đã nhận đủ hàng"</b>.
-<b>Bước 5:</b> Người bán gửi STK nhận tiền bằng lệnh:
-<code>/bank Mã_đơn STK Tên_Bank...</code>
-<b>Bước 6:</b> Admin chuyển tiền cho người bán và chốt đơn."""
-            btn_back = [[InlineKeyboardButton("🔙 Quay Lại Menu Chính", callback_data="ui_back")]]
-            await query.edit_message_text(text=txt_help, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(btn_back))
-            
-        elif data == "ui_back":
-            await query.answer()
-            await cmd_start(update, context)
-
-    except Exception as e:
-        logger.error(f"Lỗi Callback Data: {e}")
-        try: await query.answer("❌ Đã xảy ra lỗi hệ thống, vui lòng thử lại sau!", show_alert=True)
-        except: pass
+            # Gửi tin nhắn về nhóm ban đầu của đơn hàng này
+            await context.bot.send_message(
+                chat_id=trade['group_id'], 
+                text=f"<b>🎉 GIAO DỊCH {code} HOÀN TẤT TUYỆT ĐỐI!</b>\nAdmin đã chuyển tiền cho người bán. Cảm ơn các bạn!", 
+                parse_mode=ParseMode.HTML
+            )
 
 async def cmd_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Chỉ cho phép gọi trong nhóm
-    if update.effective_chat.type == "private":
-        return await update.message.reply_text("❌ Lệnh này phải được gõ trong Nhóm Giao Dịch!")
-
-    if len(context.args) < 2: 
-        return await update.message.reply_text("❌ Thiếu thông tin!\n👉 <b>Mẫu chuẩn:</b> <code>/bank Mã_đơn STK Tên_ngân_hàng</code>", parse_mode=ParseMode.HTML)
+    if len(context.args) < 2: return
     
     code = context.args[0].upper()
     bank_info = " ".join(context.args[1:])
     trade = db.get_trade(code)
     
-    if not trade:
-        return await update.message.reply_text("❌ Mã giao dịch này không tồn tại trong hệ thống!")
-        
-    if trade['status'] != Status.BUYER_DONE:
-        return await update.message.reply_text("❌ Đơn này chưa được người mua xác nhận nhận hàng, hoặc đã được giải ngân xong rồi!")
+    if not trade or trade['status'] != Status.BUYER_DONE:
+        return await update.message.reply_text("❌ Đơn chưa sẵn sàng giải ngân!")
 
-    # Cập nhật trạng thái chờ giải ngân
     db.update_trade(code, status=Status.PAYOUT_WAIT, seller_bank_info=bank_info)
     
-    # Gửi form Payout về tin nhắn riêng (DM) cho Admin để duyệt
-    adm_btn = [[InlineKeyboardButton("✅ ADMIN ĐÃ CHUYỂN TIỀN (BẤM ĐỂ CHỐT ĐƠN)", callback_data=f"adminpayout_{code}")]]
-    adm_txt = f"""<b>🏛 YÊU CẦU GIẢI NGÂN (PAYOUT)</b>
+    # Gửi yêu cầu cho Admin kèm thông tin nhóm
+    adm_kb = [[InlineKeyboardButton("✅ XÁC NHẬN ĐÃ BANK", callback_data=f"adminpayout_{code}")]]
+    adm_txt = f"""<b>🏛 YÊU CẦU GIẢI NGÂN</b>
 ━━━━━━━━━━━━━━━━━━━━
-🆔 <b>Mã Đơn:</b> <code>{code}</code>
-💰 <b>Số tiền cần chuyển trả:</b> {trade['amount']:,} VND
-💳 <b>Tài khoản nhận:</b> <code>{bank_info}</code>
-📍 <b>Nhóm yêu cầu:</b> {trade['group_name']}
-━━━━━━━━━━━━━━━━━━━━
-⚠️ <i>Sau khi chuyển khoản xong, Admin hãy bấm nút bên dưới để hệ thống báo hoàn tất vào Group!</i>"""
+🆔 Mã đơn: <code>{code}</code>
+💰 Số tiền: <code>{trade['amount']:,}</code> VND
+💳 STK: <code>{bank_info}</code>
+📍 Nhóm: {trade['group_name']}"""
     
-    try:
-        await context.bot.send_message(chat_id=CONFIG['admin_id'], text=adm_txt, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(adm_btn))
-        await update.message.reply_text("✅ <b>ĐÃ GỬI THÔNG TIN BANK CHO ADMIN!</b>\nTiền sẽ được chuyển trong giây lát, vui lòng chờ.", parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.error(f"Lỗi gửi tin cho Admin (Admin chưa start bot?): {e}")
-        await update.message.reply_text("❌ <b>Lỗi:</b> Không thể gửi tin nhắn cho Admin. Bot cần Admin chủ động inbox /start cho bot trước!")
+    await context.bot.send_message(chat_id=CONFIG['admin_id'], text=adm_txt, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(adm_kb))
+    await update.message.reply_text("✅ Đã gửi yêu cầu rút tiền cho Admin!")
 
 # ==========================================================
-#                      KHỞI CHẠY HỆ THỐNG
+#                      KHỞI CHẠY
 # ==========================================================
 async def main_runner():
     tg_app.add_handler(CommandHandler("start", cmd_start))
@@ -406,10 +349,5 @@ async def main_runner():
     await server.serve()
 
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(main_runner())
-    except (KeyboardInterrupt, SystemExit):
-        pass
-                 
+    asyncio.run(main_runner())
+        
