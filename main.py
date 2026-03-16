@@ -172,13 +172,13 @@ async def handle_payment_success(code, amount):
 # ==========================================================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Tạo nút bấm bắt buộc xem hướng dẫn
+    # Nút bấm bắt buộc dẫn tới hướng dẫn
     keyboard = [[InlineKeyboardButton("📖 XEM HƯỚNG DẪN SỬ DỤNG", callback_data="show_help")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     text = (
         "💎 **CHÀO MỪNG BẠN ĐẾN VỚI BOT TRUNG GIAN AUTO V7**\n\n"
-        "Để đảm bảo giao dịch an toàn và đúng quy trình, vui lòng nhấn vào nút bên dưới để xem hướng dẫn chi tiết trước khi bắt đầu."
+        "Để bắt đầu, vui lòng nhấn vào nút dưới đây để xem **Hướng dẫn quy trình giao dịch**."
     )
     await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
 
@@ -187,19 +187,19 @@ async def help_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     
     help_text = (
-        "📖 **HƯỚNG DẪN SỬ DỤNG BOT GDTG**\n"
+        "📖 **QUY TRÌNH GIAO DỊCH TRUNG GIAN**\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ **Tạo đơn:** Dùng lệnh tại nhóm\n"
+        "1️⃣ **Khởi tạo đơn:** Tại nhóm giao dịch, gõ theo cú pháp:\n"
         "`/taogdtg | giá | sản phẩm | @username_người_bán`\n"
-        "*(Ví dụ: /taogdtg | 500000 | Nick Game | @seller123)*\n\n"
-        "2️⃣ **Thanh toán:** Người mua quét mã QR Bot gửi và chuyển khoản đúng nội dung.\n\n"
-        "3️⃣ **Giao hàng:** Sau khi Bot báo nhận tiền, người bán bàn giao sản phẩm cho người mua.\n\n"
-        "4️⃣ **Xác nhận:** Người mua nhận hàng xong gõ:\n"
+        "*(VD: /taogdtg | 200000 | Account Game | @nguoiban)*\n\n"
+        "2️⃣ **Thanh toán:** Người mua quét QR của Bot gửi, chuyển khoản đúng **Nội dung** và **Số tiền**.\n\n"
+        "3️⃣ **Giao hàng:** Khi Bot báo đã nhận tiền, người bán bàn giao hàng/dịch vụ cho người mua.\n\n"
+        "4️⃣ **Xác nhận:** Người mua kiểm tra xong, gõ lệnh để chốt:\n"
         "`/done [mã_đơn]`\n\n"
-        "5️⃣ **Nhận tiền:** Người bán gửi STK để Admin giải ngân:\n"
-        "`/bank [mã_đơn] [Thông tin STK]`\n"
+        "5️⃣ **Giải ngân:** Người bán gửi thông tin nhận tiền:\n"
+        "`/bank [mã_đơn] [Tên Ngân Hàng - STK - Tên Chủ TK]`\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ **Lưu ý:** Chuyển sai nội dung hoặc sai số tiền sẽ bị treo đơn!"
+        "⚠️ **CẢNH BÁO:** Tuyệt đối không giao hàng khi Bot chưa báo đã nhận tiền!"
     )
     await query.edit_message_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
@@ -305,4 +305,4 @@ if __name__ == "__main__":
     loop.create_task(run_bot())
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
-    
+                           
