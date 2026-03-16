@@ -39,7 +39,7 @@ CONFIG = {
     "fee_percent": 0.01
 }
 
-DB_FILE = "system_v14.sqlite3"
+DB_FILE = "system_v15.sqlite3"
 
 class Status:
     PENDING = "CHO_THANH_TOAN"
@@ -92,19 +92,20 @@ app = FastAPI()
 tg_app = Application.builder().token(CONFIG["bot_token"]).build()
 
 # ==========================================================
-#                      WEBHOOK SEPAY (TỰ ĐỘNG)
+#                      WEBHOOK SEPAY (NHẬN BILL)
 # ==========================================================
 @app.post("/webhook")
 async def sepay_webhook(request: Request):
     try:
         data = await request.json()
         content = data.get("content", "").upper()
+        # Đây là số tiền khách vừa chuyển trong cái bill này
         amount_in = int(data.get("amount_in", 0))
         
         match = re.search(r"GD(\d+)", content)
         if match:
             code = f"GD{match.group(1)}"
-            logger.info(f"--- NHẬN BILL: {code} | TIỀN: {amount_in} ---")
+            logger.info(f"🔔 PHÁT HIỆN BILL MỚI: {code} | Số tiền: {amount_in}")
             asyncio.create_task(process_paid_invoice(code, amount_in))
         
         return {"status": "success"}
@@ -112,21 +113,23 @@ async def sepay_webhook(request: Request):
         logger.error(f"Lỗi Webhook: {e}")
         return {"status": "error"}
 
-async def process_paid_invoice(code, amount):
+async def process_paid_invoice(code, amount_received):
     trade = db.get_trade(code)
     if not trade or trade['status'] != Status.PENDING:
         return
 
-    # Nếu đủ tiền (hoặc dư tiền) thì xác nhận ngay
-    if amount >= trade['total_pay']:
+    # SO SÁNH: Tiền bill nạp vào vs Tiền cần thanh toán của đơn
+    if amount_received >= trade['total_pay']:
+        # CHUYỂN ĐỦ HOẶC DƯ -> VÀO VIỆC
         db.update_trade(code, status=Status.HOLDING)
+        
         try: await tg_app.bot.unpin_chat_message(chat_id=trade['group_id'], message_id=trade['qr_msg_id'])
         except: pass
 
         msg = f"""<b>✅ GIAO DỊCH {code} ĐÃ NHẬN ĐỦ TIỀN</b>
 ━━━━━━━━━━━━━━━━━━━━
 📦 <b>Sản phẩm:</b> {trade['product_name']}
-💰 <b>Thực nhận:</b> {amount:,} VND
+💰 <b>Số tiền nhận:</b> {amount_received:,} VND
 🛡 <b>Trạng thái:</b> BOT ĐANG GIỮ TIỀN AN TOÀN
 
 👤 <b>Người mua:</b> {trade['buyer_name']}
@@ -139,9 +142,16 @@ async def process_paid_invoice(code, amount):
         db.update_trade(code, status_msg_id=sent.message_id)
         await tg_app.bot.pin_chat_message(chat_id=trade['group_id'], message_id=sent.message_id)
     else:
-        # Thiếu tiền
-        missing = trade['total_pay'] - amount
-        txt = f"<b>⚠️ CẢNH BÁO: THIẾU TIỀN ĐƠN {code}</b>\nCần thêm: <code>{missing:,}</code> VND\nNội dung: <code>{code}</code>"
+        # CHUYỂN THIẾU -> BÁO LỖI
+        missing = trade['total_pay'] - amount_received
+        txt = f"""<b>⚠️ CẢNH BÁO: CHUYỂN THIẾU TIỀN</b>
+━━━━━━━━━━━━━━━━━━━━
+🆔 <b>Mã đơn:</b> <code>{code}</code>
+💰 <b>Cần thanh toán:</b> {trade['total_pay']:,} VND
+📥 <b>Thực nhận từ bill:</b> {amount_received:,} VND
+❌ <b>CÒN THIẾU:</b> <code>{missing:,}</code> VND
+
+<i>Vui lòng chuyển thêm đúng số tiền thiếu với nội dung chuyển khoản là <code>{code}</code></i>"""
         await tg_app.bot.send_message(chat_id=trade['group_id'], text=txt, parse_mode=ParseMode.HTML)
 
 # ==========================================================
@@ -210,10 +220,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = """<b>📖 HƯỚNG DẪN QUY TRÌNH</b>
 ━━━━━━━━━━━━━━━━━━━━
 1. <b>Tạo đơn:</b> Dùng lệnh <code>/taogdtg</code> trong nhóm.
-2. <b>Thanh toán:</b> Người mua quét mã QR (Hệ thống tự động xác nhận).
+2. <b>Thanh toán:</b> Người mua quét mã QR (Chuyển đúng số tiền).
 3. <b>Giao hàng:</b> Người bán giao hàng cho người mua.
 4. <b>Xác nhận:</b> Người mua nhấn nút <b>"Tôi đã nhận hàng"</b>.
-5. <b>Rút tiền:</b> Người bán dùng lệnh <code>/bank</code> để nhận tiền từ Admin."""
+5. <b>Rút tiền:</b> Người bán dùng lệnh <code>/bank</code> để nhận tiền."""
         await query.edit_message_text(txt, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Quay Lại", callback_data="ui_back")]]))
 
     elif data == "ui_back":
@@ -227,7 +237,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         db.update_trade(code, status=Status.BUYER_DONE)
         await query.answer("✅ Xác nhận thành công!")
-        txt = f"<b>📦 ĐƠN {code} ĐÃ Xong</b>\nNgười bán {trade['seller_name']} gửi STK rút tiền:\n<code>/bank {code} STK Bank Tên_CT</code>"
+        txt = f"<b>📦 ĐƠN {code} ĐÃ XONG</b>\nNgười bán {trade['seller_name']} gửi STK rút tiền:\n<code>/bank {code} STK Bank Tên_CT</code>"
         if query.message.photo: await query.edit_message_caption(caption=txt, parse_mode=ParseMode.HTML)
         else: await query.edit_message_text(text=txt, parse_mode=ParseMode.HTML)
 
@@ -261,4 +271,4 @@ async def main_runner():
 
 if __name__ == "__main__":
     asyncio.run(main_runner())
-        
+                                        
