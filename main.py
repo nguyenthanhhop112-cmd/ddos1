@@ -3,28 +3,19 @@ import re
 import sqlite3
 import logging
 import asyncio
-import threading
-import urllib.parse
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
-from telegram import (
-    Update, 
-    InlineKeyboardButton, 
-    InlineKeyboardMarkup, 
-    Bot
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, 
     CommandHandler, 
     CallbackQueryHandler, 
-    ContextTypes, 
-    MessageHandler, 
-    filters
+    ContextTypes
 )
 
 # ==========================================================
@@ -32,7 +23,7 @@ from telegram.ext import (
 # ==========================================================
 CONFIG = {
     "bot_token": "8560020347:AAECTuhAhuIvYz2pvDmwXS9mK4nEN-g-0EM",
-    "admin_id": 7816353760,  # ID Telegram của Admin để nhận báo cáo
+    "admin_id": 7816353760,
     "admin_handle": "@nth_dev", 
     "bank_name": "MSB",
     "bank_bin": "970426",
@@ -40,298 +31,216 @@ CONFIG = {
     "bank_owner": "NGUYEN THANH HOP",
 }
 
-DB_FILE = "gdtg_final.sqlite3"
+DB_FILE = "gdtg_pro_v7.sqlite3"
 
-# Các trạng thái của đơn hàng
-STATUS_WAIT_PAY = "CHO_THANH_TOAN"
-STATUS_PAID = "DA_THANH_TOAN_BOT_GIU"
-STATUS_DONE_WAIT_BANK = "CHO_STK_NGUOI_BAN"
-STATUS_WAIT_PAYOUT = "CHO_ADMIN_CHUYEN_TIEN"
-STATUS_COMPLETED = "HOAN_TAT"
-
-# ==========================================================
-#                      LOGIC TÍNH PHÍ
-# ==========================================================
-def calculate_fee(amount: int) -> int:
-    if amount < 100000:
-        return 5000
-    elif 100000 <= amount < 500000:
-        return 10000
-    elif 500000 <= amount < 1000000:
-        return 15000
-    elif 1000000 <= amount <= 2000000:
-        return 20000
-    else:
-        fee = int(amount * 0.01)
-        return min(fee, 30000)
+# Trạng thái logic
+ST_WAIT_PAY = "CHO_THANH_TOAN"         # Đợi buyer bank tiền
+ST_PAID_HOLDING = "BOT_GIU_TIEN"       # Bot đã nhận tiền từ SePay
+ST_BUYER_DONE = "NGUOI_MUA_XAC_NHAN"   # Buyer đã nhận hàng, bấm /done
+ST_WAIT_PAYOUT = "CHO_ADMIN_CHUYEN"    # Seller đã gửi STK
+ST_COMPLETED = "HOAN_TAT"              # Admin đã bấm nút xác nhận trả tiền
 
 # ==========================================================
-#                      DATABASE MANAGER
+#                      DATABASE CORE
 # ==========================================================
 class Database:
     def __init__(self):
-        self.init_db()
-
-    def init_db(self):
         with sqlite3.connect(DB_FILE) as conn:
             conn.execute('''CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT UNIQUE,
-                group_id INTEGER,
-                group_name TEXT,
-                buyer_id INTEGER,
-                buyer_name TEXT,
-                seller_id INTEGER,
-                seller_name TEXT,
-                amount INTEGER,
-                fee INTEGER,
-                total_pay INTEGER,
-                product_name TEXT,
-                seller_bank TEXT,
-                status TEXT,
-                created_at TEXT
-            )''')
-            conn.commit()
+                code TEXT UNIQUE, group_id INTEGER, group_name TEXT,
+                buyer_id INTEGER, buyer_name TEXT, buyer_user TEXT,
+                seller_name TEXT, amount INTEGER, fee INTEGER, total_pay INTEGER,
+                product_name TEXT, seller_bank TEXT, status TEXT, created_at TEXT)''')
 
-    def create_trade(self, data: dict):
+    def create_trade(self, data):
         with sqlite3.connect(DB_FILE) as conn:
             conn.execute("""INSERT INTO trades 
-                (code, group_id, group_name, buyer_id, buyer_name, seller_id, seller_name, 
+                (code, group_id, group_name, buyer_id, buyer_name, buyer_user, seller_name, 
                  amount, fee, total_pay, product_name, status, created_at) 
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (data['code'], data['group_id'], data['group_name'], data['buyer_id'], data['buyer_name'],
-                 data['seller_id'], data['seller_name'], data['amount'], data['fee'],
-                 data['total_pay'], data['product_name'], STATUS_WAIT_PAY, datetime.now().isoformat()))
-            conn.commit()
+                 data['buyer_user'], data['seller_name'], data['amount'], data['fee'],
+                 data['total_pay'], data['product_name'], ST_WAIT_PAY, datetime.now().isoformat()))
 
     def get_trade(self, code):
         with sqlite3.connect(DB_FILE) as conn:
             conn.row_factory = sqlite3.Row
             return conn.execute("SELECT * FROM trades WHERE code = ?", (code,)).fetchone()
 
-    def update_status(self, code, status, seller_bank=None):
+    def update_status(self, code, status, bank=None):
         with sqlite3.connect(DB_FILE) as conn:
-            if seller_bank:
-                conn.execute("UPDATE trades SET status = ?, seller_bank = ? WHERE code = ?", (status, seller_bank, code))
-            else:
-                conn.execute("UPDATE trades SET status = ? WHERE code = ?", (status, code))
-            conn.commit()
+            if bank: conn.execute("UPDATE trades SET status = ?, seller_bank = ? WHERE code = ?", (status, bank, code))
+            else: conn.execute("UPDATE trades SET status = ? WHERE code = ?", (status, code))
 
 db = Database()
-
-# ==========================================================
-#                      FASTAPI & WEBHOOK (SEPAY)
-# ==========================================================
 app = FastAPI()
-telegram_app = Application.builder().token(CONFIG["bot_token"]).build()
+tg_app = Application.builder().token(CONFIG["bot_token"]).build()
 
+# ==========================================================
+#                      TÍNH PHÍ GIAO DỊCH
+# ==========================================================
+def calc_fee(amount):
+    if amount < 100000: return 5000
+    if amount < 500000: return 10000
+    if amount < 1000000: return 15000
+    if amount <= 2000000: return 20000
+    return min(int(amount * 0.01), 30000)
+
+# ==========================================================
+#                      WEBHOOK SEPAY (TỰ ĐỘNG)
+# ==========================================================
 class SePayData(BaseModel):
     content: str
     amountIn: int
-    transactionDate: Optional[str] = None
-
-@app.get("/")
-def home():
-    return {"status": "Bot GDTG is running", "webhook_path": "/webhook"}
 
 @app.post("/webhook")
 async def sepay_webhook(data: SePayData, background_tasks: BackgroundTasks):
     match = re.search(r"GD\d+", data.content.upper())
     if match:
-        trade_code = match.group()
-        background_tasks.add_task(handle_payment_success, trade_code, data.amountIn)
-    return {"status": "received"}
+        background_tasks.add_task(handle_payment, match.group(), data.amountIn)
+    return {"status": "ok"}
 
-async def handle_payment_success(code, amount):
+async def handle_payment(code, amount):
     trade = db.get_trade(code)
-    if trade and trade['status'] == STATUS_WAIT_PAY:
-        if amount >= trade['total_pay']:
-            db.update_status(code, STATUS_PAID)
-            
-            msg = (
-                f"✅ **XÁC NHẬN: ĐÃ NHẬN TIỀN TỰ ĐỘNG**\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🆔 Mã đơn: `{code}`\n"
-                f"💰 Số tiền vào: {amount:,}đ\n"
-                f"👤 Người mua: {trade['buyer_name']}\n"
-                f"🛡 Trạng thái: **BOT ĐÃ GIỮ TIỀN AN TOÀN**\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🚀 Mời người bán **{trade['seller_name']}** giao hàng.\n"
-                f"💡 Khi nhận xong, người mua nhấn: `/done {code}`"
-            )
-            await telegram_app.bot.send_message(chat_id=trade['group_id'], text=msg, parse_mode=ParseMode.MARKDOWN)
-
-            admin_notif = (
-                f"💰 **THÔNG BÁO TIỀN VÀO (WEBHOOK)**\n"
-                f"🆔 Đơn: `{code}`\n"
-                f"💵 Số tiền thực nhận: {amount:,}đ\n"
-                f"📍 Nhóm: {trade['group_name']}"
-            )
-            await telegram_app.bot.send_message(chat_id=CONFIG['admin_id'], text=admin_notif)
-
-# ==========================================================
-#                      BOT COMMANDS
-# ==========================================================
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton("📖 XEM HƯỚNG DẪN SỬ DỤNG", callback_data="show_help")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    text = (
-        "💎 **CHÀO MỪNG BẠN ĐẾN VỚI BOT TRUNG GIAN AUTO V7**\n\n"
-        "Để đảm bảo giao dịch an toàn và đúng quy trình, vui lòng nhấn vào nút bên dưới để xem hướng dẫn chi tiết trước khi bắt đầu."
-    )
-    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
-
-async def help_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    help_text = (
-        "📖 **HƯỚNG DẪN SỬ DỤNG BOT GDTG**\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "1️⃣ **Tạo đơn:** Dùng lệnh tại nhóm\n"
-        "`/taogdtg | giá | sản phẩm | @username_người_bán`\n"
-        "*(Ví dụ: /taogdtg | 500000 | Nick Game | @seller123)*\n\n"
-        "2️⃣ **Thanh toán:** Người mua quét mã QR Bot gửi và chuyển khoản đúng nội dung.\n\n"
-        "3️⃣ **Giao hàng:** Sau khi Bot báo nhận tiền, người bán bàn giao sản phẩm cho người mua.\n\n"
-        "4️⃣ **Xác nhận:** Người mua nhận hàng xong gõ:\n"
-        "`/done [mã_đơn]`\n\n"
-        "5️⃣ **Nhận tiền:** Người bán gửi STK để Admin giải ngân:\n"
-        "`/bank [mã_đơn] [Thông tin STK]`\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ **Lưu ý:** Chuyển sai nội dung hoặc sai số tiền sẽ bị treo đơn!"
-    )
-    await query.edit_message_text(help_text, parse_mode=ParseMode.MARKDOWN)
-
-async def create_trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type == "private":
-        return await update.message.reply_text("⚠️ Vui lòng thêm Bot vào Nhóm để sử dụng!")
-
-    try:
-        parts = [p.strip() for p in update.message.text.split("|")]
-        amount = int(re.sub(r"\D", "", parts[1]))
-        product = parts[2]
-        seller_mention = parts[3]
+    if trade and trade['status'] == ST_WAIT_PAY and amount >= trade['total_pay']:
+        db.update_status(code, ST_PAID_HOLDING)
         
-        buyer = update.effective_user
-        code = f"GD{int(datetime.now().timestamp())}"
-        fee = calculate_fee(amount)
-        total = amount + fee
+        # Thông báo trong nhóm & Ghim tin
+        msg = (
+            f"✅ **ĐÃ NHẬN TIỀN THÀNH CÔNG**\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 Mã đơn: `{code}`\n"
+            f"💰 Số tiền: {amount:,}đ\n"
+            f"👤 Người mua: {trade['buyer_name']}\n\n"
+            f"🛡 **TRẠNG THÁI:** Bot đang giữ tiền.\n"
+            f"🚀 Mời người bán **{trade['seller_name']}** giao hàng ngay.\n"
+            f"💡 Người mua nhận hàng xong hãy gõ: `/done {code}`"
+        )
+        sent_msg = await tg_app.bot.send_message(chat_id=trade['group_id'], text=msg, parse_mode=ParseMode.MARKDOWN)
+        try: await tg_app.bot.pin_chat_message(chat_id=trade['group_id'], message_id=sent_msg.message_id)
+        except: pass
 
+        # Thông báo Admin chi tiết
+        adm_msg = (
+            f"💰 **TIỀN VÀO HỆ THỐNG**\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Mã: `{code}` | Nhóm: `{trade['group_name']}`\n"
+            f"Thực nhận: `{amount:,}đ`\n"
+            f"Buyer: {trade['buyer_name']} ({trade['buyer_user']})"
+        )
+        await tg_app.bot.send_message(chat_id=CONFIG['admin_id'], text=adm_msg)
+
+# ==========================================================
+#                      LỆNH TELEGRAM
+# ==========================================================
+async def start(update: Update, context):
+    txt = (
+        "🛡 **HỆ THỐNG TRUNG GIAN AUTO V7**\n"
+        "Giao dịch an toàn - Tự động 100%\n\n"
+        "📌 **LỆNH SỬ DỤNG:**\n"
+        "1. Tạo đơn: `/taogdtg | giá | sản phẩm | @nguoiban`\n"
+        "2. Xác nhận: `/done [mã_đơn]`\n"
+        "3. Nhận tiền: `/bank [mã_đơn] [STK]`"
+    )
+    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+
+async def create_trade(update: Update, context):
+    if update.effective_chat.type == "private": return
+    try:
+        p = [i.strip() for i in update.message.text.split("|")]
+        amt = int(re.sub(r"\D", "", p[1]))
+        code = f"GD{int(datetime.now().timestamp())}"
+        fee = calc_fee(amt)
+        total = amt + fee
+        
         db.create_trade({
             "code": code, "group_id": update.effective_chat.id, "group_name": update.effective_chat.title,
-            "buyer_id": buyer.id, "buyer_name": buyer.full_name, "seller_id": 0, "seller_name": seller_mention,
-            "amount": amount, "fee": fee, "total_pay": total, "product_name": product
+            "buyer_id": update.effective_user.id, "buyer_name": update.effective_user.full_name,
+            "buyer_user": f"@{update.effective_user.username}", "seller_name": p[3],
+            "amount": amt, "fee": fee, "total_pay": total, "product_name": p[2]
         })
 
-        qr_url = f"https://img.vietqr.io/image/{CONFIG['bank_bin']}-{CONFIG['bank_stk']}-compact2.png?amount={total}&addInfo={code}&accountName={CONFIG['bank_owner']}"
-        caption = (
-            f"🤝 **GIAO DỊCH TRUNG GIAN: {code}**\n"
+        qr = f"https://img.vietqr.io/image/{CONFIG['bank_bin']}-{CONFIG['bank_stk']}-compact2.png?amount={total}&addInfo={code}"
+        cap = (
+            f"🤝 **ĐƠN GIAO DỊCH MỚI: {code}**\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"📦 **Sản phẩm:** {product}\n"
-            f"👤 **Người mua:** {buyer.full_name}\n"
-            f"👤 **Người bán:** {seller_mention}\n"
-            f"💰 **Giá:** {amount:,}đ | **Phí:** {fee:,}đ\n"
-            f"💳 **Tổng thanh toán:** `{total:,}`đ\n"
+            f"📦 **Sản phẩm:** {p[2]}\n"
+            f"👤 **Người bán:** {p[3]}\n"
+            f"💰 **Giá:** {amt:,}đ | **Phí:** {fee:,}đ\n"
+            f"💳 **Tổng cần bank:** `{total:,}`đ\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"📝 **Nội dung:** `{code}`"
+            f"⚠️ **Nội dung bắt buộc:** `{code}`"
         )
-        await update.message.reply_photo(photo=qr_url, caption=caption, parse_mode=ParseMode.MARKDOWN)
+        msg = await update.message.reply_photo(photo=qr, caption=cap, parse_mode=ParseMode.MARKDOWN)
+        try: await tg_app.bot.pin_chat_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
+        except: pass
+    except: await update.message.reply_text("❌ Lỗi! Cú pháp: `/taogdtg | giá | SP | @nguoiban`")
 
-        await telegram_app.bot.send_message(chat_id=CONFIG['admin_id'], text=f"🆕 **ĐƠN MỚI:** `{code}` tại nhóm `{update.effective_chat.title}`\nGiá: {amount:,}đ")
-    except:
-        await update.message.reply_text("❌ Lỗi cú pháp! Ví dụ: `/taogdtg | 100000 | Tên SP | @nguoiban`")
-
-async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return await update.message.reply_text("⚠️ `/done [mã_đơn]`")
-    
+async def done(update: Update, context):
+    if not context.args: return
     code = context.args[0].upper()
     trade = db.get_trade(code)
-    
-    if not trade or update.effective_user.id != trade['buyer_id'] or trade['status'] != STATUS_PAID:
-        return await update.message.reply_text("❌ Đơn không tồn tại hoặc bạn không phải người mua.")
+    if trade and update.effective_user.id == trade['buyer_id'] and trade['status'] == ST_PAID_HOLDING:
+        db.update_status(code, ST_BUYER_DONE)
+        txt = (
+            f"✅ **NGƯỜI MUA ĐÃ XÁC NHẬN**\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 Mã đơn: `{code}`\n"
+            f"🔔 Mời người bán **{trade['seller_name']}** gửi STK để nhận tiền:\n"
+            f"👉 Cú pháp: `/bank {code} [Số tài khoản + Ngân hàng]`"
+        )
+        await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+        await tg_app.bot.send_message(chat_id=CONFIG['admin_id'], text=f"🔔 Đơn `{code}` đã xong (Buyer bấm /done). Chờ STK...")
 
-    db.update_status(code, STATUS_DONE_WAIT_BANK)
-    await update.message.reply_text(f"✅ Người mua đã xác nhận! Mời {trade['seller_name']} gửi STK:\n👉 `/bank {code} [Thông tin STK]`")
-    await telegram_app.bot.send_message(chat_id=CONFIG['admin_id'], text=f"🔔 Đơn `{code}`: Buyer đã bấm /done. Chờ STK của Seller...")
-
-async def bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2: return await update.message.reply_text("⚠️ `/bank [mã_đơn] [STK]`")
-
-    code = context.args[0].upper()
-    bank_info = " ".join(context.args[1:])
+async def bank(update: Update, context):
+    if len(context.args) < 2: return
+    code, info = context.args[0].upper(), " ".join(context.args[1:])
     trade = db.get_trade(code)
+    if trade and trade['status'] == ST_BUYER_DONE:
+        db.update_status(code, ST_WAIT_PAYOUT, bank=info)
+        
+        # Báo Admin giải ngân
+        btn = [[InlineKeyboardButton("✅ XÁC NHẬN ĐÃ GIẢI NGÂN", callback_data=f"pay_{code}")]]
+        adm_txt = (
+            f"💸 **YÊU CẦU RÚT TIỀN**\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 Đơn: `{code}`\n"
+            f"💰 Tiền trả Seller: **{trade['amount']:,}đ**\n"
+            f"💳 **STK ĐÍCH:** `{info}`\n"
+            f"📍 Nhóm: {trade['group_name']}"
+        )
+        await tg_app.bot.send_message(chat_id=CONFIG['admin_id'], text=adm_txt, reply_markup=InlineKeyboardMarkup(btn))
+        await update.message.reply_text("✅ Đã gửi thông tin cho Admin. Vui lòng đợi giải ngân!")
 
-    if not trade or trade['status'] != STATUS_DONE_WAIT_BANK:
-        return await update.message.reply_text("❌ Đơn hàng không ở trạng thái chờ gửi STK.")
-
-    db.update_status(code, STATUS_WAIT_PAYOUT, seller_bank=bank_info)
-
-    admin_msg = (
-        f"🚨 **YÊU CẦU GIẢI NGÂN: {code}**\n"
-        f"📍 Nhóm: {trade['group_name']}\n"
-        f"👤 Seller: {trade['seller_name']}\n"
-        f"💳 **STK:** `{bank_info}`\n"
-        f"💵 **TIỀN TRẢ:** **{trade['amount']:,}đ**\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"Bấm nút dưới đây sau khi bạn đã chuyển khoản xong."
-    )
-    keyboard = [[InlineKeyboardButton("✅ XÁC NHẬN ĐÃ CHUYỂN TIỀN", callback_data=f"pay_{code}")]]
-    await telegram_app.bot.send_message(chat_id=CONFIG['admin_id'], text=admin_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-    await update.message.reply_text("✅ Đã gửi STK cho Admin. Bạn vui lòng đợi Admin giải ngân!")
-
-async def admin_pay_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data.startswith("pay_"):
-        code = query.data.split("_")[1]
+async def admin_callback(update: Update, context):
+    q = update.callback_query
+    if q.data.startswith("pay_"):
+        code = q.data.split("_")[1]
         trade = db.get_trade(code)
         if trade:
-            db.update_status(code, STATUS_COMPLETED)
-            await query.edit_message_text(f"✅ Đã xác nhận giải ngân thành công cho đơn `{code}`.")
-            
-            final_msg = (
-                f"🎉 **GIAO DỊCH HOÀN TẤT: {code}**\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"✅ Admin đã chuyển khoản cho người bán thành công.\n"
-                f"🤝 Cảm ơn các bạn đã sử dụng dịch vụ!"
-            )
-            await telegram_app.bot.send_message(chat_id=trade['group_id'], text=final_msg, parse_mode=ParseMode.MARKDOWN)
-    elif query.data == "show_help":
-        await help_callback_handler(update, context)
+            db.update_status(code, ST_COMPLETED)
+            await q.edit_message_text(f"✅ Đã giải ngân đơn `{code}`")
+            await tg_app.bot.send_message(chat_id=trade['group_id'], text=f"🎉 **GIAO DỊCH {code} HOÀN TẤT!**\nAdmin đã chuyển tiền cho người bán thành công.")
 
 # ==========================================================
-#                      KHỞI CHẠY (FIXED)
+#                      RUN SYSTEM
 # ==========================================================
 async def main():
-    # 1. Đăng ký các handler
-    telegram_app.add_handler(CommandHandler("start", start_cmd))
-    telegram_app.add_handler(CommandHandler("taogdtg", create_trade_cmd))
-    telegram_app.add_handler(CommandHandler("done", done_cmd))
-    telegram_app.add_handler(CommandHandler("bank", bank_cmd))
-    telegram_app.add_handler(CallbackQueryHandler(admin_pay_handler))
+    tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(CommandHandler("taogdtg", create_trade))
+    tg_app.add_handler(CommandHandler("done", done))
+    tg_app.add_handler(CommandHandler("bank", bank))
+    tg_app.add_handler(CallbackQueryHandler(admin_callback))
 
-    # 2. Khởi tạo Telegram App
-    await telegram_app.initialize()
-    await telegram_app.start()
-    
-    # Chạy polling (nhận tin nhắn) trong một task riêng
-    asyncio.create_task(telegram_app.updater.start_polling())
+    await tg_app.initialize()
+    await tg_app.start()
+    asyncio.create_task(tg_app.updater.start_polling())
 
-    # 3. Chạy Web Server (FastAPI) để nhận Webhook SePay
     port = int(os.environ.get("PORT", 10000))
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio")
-    server = uvicorn.Server(config)
-    
-    # serve() là một coroutine, nó sẽ giữ cho loop chạy mãi mãi
-    await server.serve()
+    srv = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio"))
+    await srv.serve()
 
 if __name__ == "__main__":
-    try:
-        # Sử dụng asyncio.run() - Cách duy nhất đúng chuẩn cho Python 3.10+
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
-    
+    asyncio.run(main())
+                             
