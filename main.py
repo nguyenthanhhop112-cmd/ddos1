@@ -98,14 +98,22 @@ tg_app = Application.builder().token(CONFIG["bot_token"]).build()
 async def sepay_webhook(request: Request):
     try:
         data = await request.json()
-        content = data.get("content", "").upper()
-        # Chuyển đổi amount_in sang kiểu int để so sánh chính xác
-        amount_in = int(float(data.get("amount_in", 0)))
+        logger.info(f"📩 Webhook Data: {data}")
+        
+        # Lấy nội dung chuyển khoản
+        content = str(data.get("content", "")).upper()
+        
+        # BÓC TÁCH SỐ TIỀN: Thử tất cả các key có thể có của SePay
+        # Lọc sạch dấu chấm, dấu phẩy, khoảng cách bằng Regex
+        raw_val = data.get("amount_in") or data.get("amount") or data.get("transferAmount") or "0"
+        clean_val = re.sub(r"\D", "", str(raw_val))
+        amount_in = int(clean_val) if clean_val else 0
         
         match = re.search(r"GD(\d+)", content)
         if match:
             code = f"GD{match.group(1)}"
-            logger.info(f"🔔 PHÁT HIỆN BILL MỚI: {code} | Số tiền: {amount_in}")
+            logger.info(f"🔔 BILL HỢP LỆ: {code} | Số tiền: {amount_in}")
+            # Xử lý hóa đơn ngay lập tức
             asyncio.create_task(process_paid_invoice(code, amount_in))
         
         return {"status": "success"}
@@ -115,21 +123,29 @@ async def sepay_webhook(request: Request):
 
 async def process_paid_invoice(code, amount_received):
     trade = db.get_trade(code)
+    # Nếu đơn không tồn tại hoặc đã được thanh toán rồi thì bỏ qua
     if not trade or trade['status'] != Status.PENDING:
         return
 
-    # CHỈ CẦN LỚN HƠN HOẶC BẰNG LÀ DUYỆT (BẤT KỂ DƯ BAO NHIÊU)
-    if int(amount_received) >= int(trade['total_pay']):
-        # CẬP NHẬT TRẠNG THÁI TRƯỚC ĐỂ TRÁNH DOUBLE BILL
+    # Lấy số tiền cần thanh toán từ DB
+    total_needed = int(trade['total_pay'])
+    actual_received = int(amount_received)
+
+    # LOGIC: Chỉ cần >= là duyệt, bất kể dư bao nhiêu
+    if actual_received >= total_needed:
+        # 1. Cập nhật trạng thái ngay để chặn double bill
         db.update_trade(code, status=Status.HOLDING)
         
-        try: await tg_app.bot.unpin_chat_message(chat_id=trade['group_id'], message_id=trade['qr_msg_id'])
-        except: pass
+        # 2. Gỡ Pin mã QR cũ
+        try: 
+            await tg_app.bot.unpin_chat_message(chat_id=trade['group_id'], message_id=trade['qr_msg_id'])
+        except: 
+            pass
 
         msg = f"""<b>✅ GIAO DỊCH {code} ĐÃ NHẬN ĐỦ TIỀN</b>
 ━━━━━━━━━━━━━━━━━━━━
 📦 <b>Sản phẩm:</b> {trade['product_name']}
-💰 <b>Số tiền nhận:</b> {amount_received:,} VND
+💰 <b>Số tiền nhận:</b> {actual_received:,} VND
 🛡 <b>Trạng thái:</b> BOT ĐANG GIỮ TIỀN AN TOÀN
 
 👤 <b>Người mua:</b> {trade['buyer_name']}
@@ -139,16 +155,21 @@ async def process_paid_invoice(code, amount_received):
         
         btn = [[InlineKeyboardButton("✅ TÔI ĐÃ NHẬN ĐỦ HÀNG", callback_data=f"done_{code}")]]
         sent = await tg_app.bot.send_message(chat_id=trade['group_id'], text=msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(btn))
+        
+        # Lưu tin nhắn trạng thái mới và Pin nó lại
         db.update_trade(code, status_msg_id=sent.message_id)
-        await tg_app.bot.pin_chat_message(chat_id=trade['group_id'], message_id=sent.message_id)
+        try:
+            await tg_app.bot.pin_chat_message(chat_id=trade['group_id'], message_id=sent.message_id)
+        except:
+            pass
     else:
-        # CHỈ BÁO THIẾU KHI THỰC SỰ NHỎ HƠN SỐ TIỀN CẦN THÀNH TOÁN
-        missing = trade['total_pay'] - amount_received
+        # Trường hợp thực sự thiếu tiền (số tiền bóc tách được nhỏ hơn đơn)
+        missing = total_needed - actual_received
         txt = f"""<b>⚠️ CẢNH BÁO: CHUYỂN THIẾU TIỀN</b>
 ━━━━━━━━━━━━━━━━━━━━
 🆔 <b>Mã đơn:</b> <code>{code}</code>
-💰 <b>Cần thanh toán:</b> {trade['total_pay']:,} VND
-📥 <b>Thực nhận từ bill:</b> {amount_received:,} VND
+💰 <b>Cần thanh toán:</b> {total_needed:,} VND
+📥 <b>Thực nhận từ bill:</b> {actual_received:,} VND
 ❌ <b>CÒN THIẾU:</b> <code>{missing:,}</code> VND
 
 <i>Vui lòng chuyển thêm đúng số tiền thiếu với nội dung chuyển khoản là <code>{code}</code></i>"""
@@ -267,8 +288,13 @@ async def main_runner():
     await tg_app.initialize()
     await tg_app.start()
     asyncio.create_task(tg_app.updater.start_polling())
-    await uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), loop="asyncio")).serve()
+    
+    # Khởi chạy Webhook Server
+    port = int(os.environ.get("PORT", 10000))
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio")
+    server = uvicorn.Server(config)
+    await server.serve()
 
 if __name__ == "__main__":
     asyncio.run(main_runner())
-        
+    
