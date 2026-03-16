@@ -136,7 +136,6 @@ def home():
 
 @app.post("/webhook")
 async def sepay_webhook(data: SePayData, background_tasks: BackgroundTasks):
-    # Tìm mã GD trong nội dung chuyển khoản của SePay
     match = re.search(r"GD\d+", data.content.upper())
     if match:
         trade_code = match.group()
@@ -146,11 +145,8 @@ async def sepay_webhook(data: SePayData, background_tasks: BackgroundTasks):
 async def handle_payment_success(code, amount):
     trade = db.get_trade(code)
     if trade and trade['status'] == STATUS_WAIT_PAY:
-        # Kiểm tra nếu khách chuyển đủ tiền (hoặc nhiều hơn)
         if amount >= trade['total_pay']:
             db.update_status(code, STATUS_PAID)
-            
-            # Thông báo nhóm
             msg = (
                 f"✅ **XÁC NHẬN: ĐÃ NHẬN TIỀN TỰ ĐỘNG**\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -163,8 +159,6 @@ async def handle_payment_success(code, amount):
                 f"💡 Khi nhận xong, người mua nhấn: `/done {code}`"
             )
             await telegram_app.bot.send_message(chat_id=trade['group_id'], text=msg, parse_mode=ParseMode.MARKDOWN)
-
-            # Báo cho Admin biết có tiền vào
             admin_notif = (
                 f"💰 **THÔNG BÁO TIỀN VÀO (WEBHOOK)**\n"
                 f"🆔 Đơn: `{code}`\n"
@@ -178,37 +172,54 @@ async def handle_payment_success(code, amount):
 # ==========================================================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Tạo nút bấm bắt buộc xem hướng dẫn
+    keyboard = [[InlineKeyboardButton("📖 XEM HƯỚNG DẪN SỬ DỤNG", callback_data="show_help")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     text = (
-        "💎 **BOT TRUNG GIAN AUTO V7**\n"
-        "*(Tích hợp Webhook SePay - Duyệt tay an toàn)*\n\n"
-        "📍 **Lệnh trong nhóm:**\n"
-        "👉 `/taogdtg | giá | sản phẩm | @người_bán`\n"
-        "👉 `/done [mã_đơn]` - Người mua xác nhận nhận hàng.\n"
-        "👉 `/bank [mã_đơn] [STK]` - Người bán gửi thông tin nhận tiền."
+        "💎 **CHÀO MỪNG BẠN ĐẾN VỚI BOT TRUNG GIAN AUTO V7**\n\n"
+        "Để đảm bảo giao dịch an toàn và đúng quy trình, vui lòng nhấn vào nút bên dưới để xem hướng dẫn chi tiết trước khi bắt đầu."
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+
+async def help_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    help_text = (
+        "📖 **HƯỚNG DẪN SỬ DỤNG BOT GDTG**\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "1️⃣ **Tạo đơn:** Dùng lệnh tại nhóm\n"
+        "`/taogdtg | giá | sản phẩm | @username_người_bán`\n"
+        "*(Ví dụ: /taogdtg | 500000 | Nick Game | @seller123)*\n\n"
+        "2️⃣ **Thanh toán:** Người mua quét mã QR Bot gửi và chuyển khoản đúng nội dung.\n\n"
+        "3️⃣ **Giao hàng:** Sau khi Bot báo nhận tiền, người bán bàn giao sản phẩm cho người mua.\n\n"
+        "4️⃣ **Xác nhận:** Người mua nhận hàng xong gõ:\n"
+        "`/done [mã_đơn]`\n\n"
+        "5️⃣ **Nhận tiền:** Người bán gửi STK để Admin giải ngân:\n"
+        "`/bank [mã_đơn] [Thông tin STK]`\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ **Lưu ý:** Chuyển sai nội dung hoặc sai số tiền sẽ bị treo đơn!"
+    )
+    await query.edit_message_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
 async def create_trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
         return await update.message.reply_text("⚠️ Vui lòng thêm Bot vào Nhóm để sử dụng!")
-
     try:
         parts = [p.strip() for p in update.message.text.split("|")]
         amount = int(re.sub(r"\D", "", parts[1]))
         product = parts[2]
         seller_mention = parts[3]
-        
         buyer = update.effective_user
         code = f"GD{int(datetime.now().timestamp())}"
         fee = calculate_fee(amount)
         total = amount + fee
-
         db.create_trade({
             "code": code, "group_id": update.effective_chat.id, "group_name": update.effective_chat.title,
             "buyer_id": buyer.id, "buyer_name": buyer.full_name, "seller_id": 0, "seller_name": seller_mention,
             "amount": amount, "fee": fee, "total_pay": total, "product_name": product
         })
-
         qr_url = f"https://img.vietqr.io/image/{CONFIG['bank_bin']}-{CONFIG['bank_stk']}-compact2.png?amount={total}&addInfo={code}&accountName={CONFIG['bank_owner']}"
         caption = (
             f"🤝 **GIAO DỊCH TRUNG GIAN: {code}**\n"
@@ -222,38 +233,28 @@ async def create_trade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📝 **Nội dung:** `{code}`"
         )
         await update.message.reply_photo(photo=qr_url, caption=caption, parse_mode=ParseMode.MARKDOWN)
-
-        # Báo Admin có đơn mới
         await telegram_app.bot.send_message(chat_id=CONFIG['admin_id'], text=f"🆕 **ĐƠN MỚI:** `{code}` tại nhóm `{update.effective_chat.title}`\nGiá: {amount:,}đ")
     except:
         await update.message.reply_text("❌ Lỗi cú pháp! Ví dụ: `/taogdtg | 100000 | Tên SP | @nguoiban`")
 
 async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args: return await update.message.reply_text("⚠️ `/done [mã_đơn]`")
-    
     code = context.args[0].upper()
     trade = db.get_trade(code)
-    
     if not trade or update.effective_user.id != trade['buyer_id'] or trade['status'] != STATUS_PAID:
         return await update.message.reply_text("❌ Đơn không tồn tại hoặc bạn không phải người mua.")
-
     db.update_status(code, STATUS_DONE_WAIT_BANK)
     await update.message.reply_text(f"✅ Người mua đã xác nhận! Mời {trade['seller_name']} gửi STK:\n👉 `/bank {code} [Thông tin STK]`")
     await telegram_app.bot.send_message(chat_id=CONFIG['admin_id'], text=f"🔔 Đơn `{code}`: Buyer đã bấm /done. Chờ STK của Seller...")
 
 async def bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2: return await update.message.reply_text("⚠️ `/bank [mã_đơn] [STK]`")
-
     code = context.args[0].upper()
     bank_info = " ".join(context.args[1:])
     trade = db.get_trade(code)
-
     if not trade or trade['status'] != STATUS_DONE_WAIT_BANK:
         return await update.message.reply_text("❌ Đơn hàng không ở trạng thái chờ gửi STK.")
-
     db.update_status(code, STATUS_WAIT_PAYOUT, seller_bank=bank_info)
-
-    # Gửi yêu cầu giải ngân cho Admin
     admin_msg = (
         f"🚨 **YÊU CẦU GIẢI NGÂN: {code}**\n"
         f"📍 Nhóm: {trade['group_name']}\n"
@@ -270,14 +271,12 @@ async def bank_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_pay_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.data.startswith("pay_"):
         code = query.data.split("_")[1]
         trade = db.get_trade(code)
         if trade:
             db.update_status(code, STATUS_COMPLETED)
             await query.edit_message_text(f"✅ Đã xác nhận giải ngân thành công cho đơn `{code}`.")
-            
             final_msg = (
                 f"🎉 **GIAO DỊCH HOÀN TẤT: {code}**\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -285,6 +284,8 @@ async def admin_pay_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🤝 Cảm ơn các bạn đã sử dụng dịch vụ!"
             )
             await telegram_app.bot.send_message(chat_id=trade['group_id'], text=final_msg, parse_mode=ParseMode.MARKDOWN)
+    elif query.data == "show_help":
+        await help_callback_handler(update, context)
 
 # ==========================================================
 #                      KHỞI CHẠY
@@ -295,7 +296,6 @@ async def run_bot():
     telegram_app.add_handler(CommandHandler("done", done_cmd))
     telegram_app.add_handler(CommandHandler("bank", bank_cmd))
     telegram_app.add_handler(CallbackQueryHandler(admin_pay_handler))
-
     await telegram_app.initialize()
     await telegram_app.start()
     await telegram_app.updater.start_polling()
@@ -303,6 +303,6 @@ async def run_bot():
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.create_task(run_bot())
-    # Chạy Web Server cho Render và Webhook SePay
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+    
