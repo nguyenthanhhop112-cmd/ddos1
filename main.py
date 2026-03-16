@@ -3,6 +3,7 @@ import re
 import sqlite3
 import logging
 import asyncio
+import httpx  # Thêm thư viện này để tự ping (pip install httpx)
 from datetime import datetime
 from typing import Optional
 
@@ -37,6 +38,7 @@ CONFIG = {
     "bank_owner": "NGUYEN THANH HOP",
     "fee_min": 5000,
     "fee_percent": 0.01,
+    "app_url": os.environ.get("APP_URL", "https://your-app-name.onrender.com"), # Cần điền URL Render vào env
     "aml_note": "⚠️ <b>LƯU Ý:</b> Hệ thống nghiêm cấm hành vi rửa tiền. Mọi nguồn tiền bẩn, tiền vi phạm pháp luật nếu bị phát hiện sẽ bị phong tỏa vĩnh viễn và cung cấp thông tin cho cơ quan chức năng."
 }
 
@@ -47,8 +49,10 @@ class Status:
     HOLDING = "BOT_DANG_GIU_TIEN"
     BUYER_DONE = "NGUOI_MUA_XAC_NHAN"
     PAYOUT_WAIT = "CHO_GIAI_NGAN"
+    REFUND_WAIT = "CHO_HOAN_TIEN" # Trạng thái mới
     COMPLETED = "THANH_CONG"
     CANCELLED = "DA_HUY"
+    REFUNDED = "DA_HOAN_TIEN"    # Trạng thái mới
 
 # ==========================================================
 #                      DATABASE ARCHITECTURE
@@ -61,7 +65,6 @@ class Database:
 
     def _init_db(self):
         with self.conn:
-            # Thêm các cột quản lý hủy đơn và ghi chú
             self.conn.execute('''CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 code TEXT UNIQUE, group_id INTEGER, group_name TEXT,
@@ -103,11 +106,26 @@ app = FastAPI()
 tg_app = Application.builder().token(CONFIG["bot_token"]).build()
 
 # ==========================================================
+#                      CHỐNG TREO (KEEP ALIVE)
+# ==========================================================
+async def keep_alive():
+    """Tự động ping để tránh Render tắt bot"""
+    await asyncio.sleep(10) # Đợi bot khởi động xong
+    while True:
+        try:
+            async with httpx.AsyncClient() as client:
+                # Ping chính endpoint của bot
+                response = await client.get(CONFIG["app_url"], timeout=10)
+                logger.info(f"🔄 Keep-alive ping: {response.status_code}")
+        except Exception as e:
+            logger.error(f"❌ Keep-alive error: {e}")
+        await asyncio.sleep(300) # Ping mỗi 5 phút
+
+# ==========================================================
 #                      WEBHOOK SEPAY (NHẬN BILL)
 # ==========================================================
 @app.get("/")
 async def health_check():
-    """Endpoint giúp treo bot trên Render không bị sleep"""
     return {"status": "online", "timestamp": datetime.now().isoformat()}
 
 @app.post("/webhook")
@@ -270,6 +288,32 @@ async def cmd_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"❌ Trạng thái đơn không hợp lệ để rút tiền! (Hiện tại: {trade['status']})")
 
+# MỚI: LỆNH HOÀN TIỀN
+async def cmd_hoantien(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        return await update.message.reply_text("❌ Cú pháp: <code>/hoantien [MãGD] [STK Hoàn Tiền]</code>", parse_mode=ParseMode.HTML)
+    
+    code, info = context.args[0].upper(), " ".join(context.args[1:])
+    trade = db.get_trade(code)
+    
+    if not trade:
+        return await update.message.reply_text("❌ Đơn không tồn tại!")
+
+    # Chỉ cho phép Buyer hoặc Admin yêu cầu hoàn tiền khi đơn đang HOLDING hoặc BUYER_DONE
+    is_admin = update.effective_user.id == CONFIG['admin_id']
+    is_buyer = update.effective_user.id == trade['buyer_id']
+    
+    if not (is_admin or is_buyer):
+        return await update.message.reply_text("⛔ Chỉ người mua hoặc Admin mới có quyền yêu cầu hoàn tiền!")
+
+    if trade['status'] in [Status.HOLDING, Status.BUYER_DONE, Status.PAYOUT_WAIT]:
+        db.update_trade(code, status=Status.REFUND_WAIT, seller_bank_info=info)
+        kb = [[InlineKeyboardButton("🔄 XÁC NHẬN HOÀN TIỀN", callback_data=f"adminrefund_{code}")]]
+        await context.bot.send_message(CONFIG['admin_id'], f"🚨 <b>YÊU CẦU HOÀN TIỀN: {code}</b>\n💰 Số tiền hoàn: {trade['total_pay']:,} VND\n💳 STK Nhận: {info}\n👤 Buyer: {trade['buyer_name']}\n📂 Nhóm: {trade['group_name']}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+        await update.message.reply_text("✅ <b>Đã gửi yêu cầu hoàn tiền!</b>\nAdmin sẽ kiểm tra và thực hiện hoàn tiền cho bạn.", parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(f"❌ Trạng thái đơn không thể hoàn tiền! ({trade['status']})")
+
 async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args: return await update.message.reply_text("❌ Vui lòng nhập mã đơn!")
     code = context.args[0].upper()
@@ -327,7 +371,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 2️⃣ <b>Thanh toán:</b> Người mua Quét mã QR chuyển tiền cho Bot.
 3️⃣ <b>Giao hàng:</b> Bot nhận tiền -> Báo người bán giao hàng.
 4️⃣ <b>Xác nhận:</b> Người mua nhận xong bấm <b>[Đã nhận hàng]</b>.
-5️⃣ <b>Rút tiền:</b> Người bán dùng <code>/bank</code> để nhận tiền về STK."""
+5️⃣ <b>Rút tiền:</b> Người bán dùng <code>/bank</code> để nhận tiền về STK.
+🆘 <b>Hoàn tiền:</b> Nếu có tranh chấp dùng <code>/hoantien</code>."""
         await query.edit_message_text(txt, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Quay Lại", callback_data="ui_back")]]))
 
     elif data == "ui_back":
@@ -373,10 +418,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trade = db.get_trade(code)
         if trade['status'] == Status.PAYOUT_WAIT:
             db.update_trade(code, status=Status.COMPLETED)
-            await query.edit_message_text(f"✅ Đã giải ngân thành công đơn {code}")
-            await context.bot.send_message(trade['group_id'], f"<b>🎉 CHÚC MỪNG! GIAO DỊCH {code} ĐÃ HOÀN TẤT 100%</b>\nCảm ơn các bạn đã sử dụng dịch vụ trung gian uy tín.", parse_mode=ParseMode.HTML)
+            await query.edit_message_text(f"✅ Đã hoàn tiền thành công đơn {code}")
+            await context.bot.send_message(trade['group_id'], f"<b>↩️ HOÀN TIỀN: Giao dịch {code} đã được hoàn tiền cho người mua.</b>\nTrạng thái: Đã kết thúc.", parse_mode=ParseMode.HTML)
         else:
-            await query.answer("⚠️ Đơn này đã được xử lý trước đó.")
+            await query.answer("⚠️ Đơn này không ở trạng thái chờ hoàn tiền!")
 
 # ==========================================================
 #                      RUNNER
@@ -386,6 +431,7 @@ async def main_runner():
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("taogdtg", cmd_taogdtg))
     tg_app.add_handler(CommandHandler("bank", cmd_bank))
+    tg_app.add_handler(CommandHandler("hoantien", cmd_hoantien)) # Thêm lệnh mới
     tg_app.add_handler(CommandHandler("check", cmd_check))
     tg_app.add_handler(CommandHandler("huy", cmd_huy))
     tg_app.add_handler(CommandHandler("thongke", cmd_thongke))
@@ -397,10 +443,12 @@ async def main_runner():
     
     # Chạy Polling cho Telegram trong background
     asyncio.create_task(tg_app.updater.start_polling())
+    # Chạy task keep-alive để bot không bị treo
+    asyncio.create_task(keep_alive())
+    
     logger.info("🤖 Bot Telegram is running...")
     
     # Chạy Webhook Server (FastAPI)
-    # Cấu hình port cho Render hoặc Replit
     port = int(os.environ.get("PORT", 8080)) 
     config = uvicorn.Config(app, host="0.0.0.0", port=port, loop="asyncio")
     server = uvicorn.Server(config)
