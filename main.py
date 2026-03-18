@@ -49,10 +49,10 @@ class Status:
     HOLDING = "BOT_DANG_GIU_TIEN"
     BUYER_DONE = "NGUOI_MUA_XAC_NHAN"
     PAYOUT_WAIT = "CHO_GIAI_NGAN"
-    REFUND_WAIT = "CHO_HOAN_TIEN" # Trạng thái mới
+    REFUND_WAIT = "CHO_HOAN_TIEN" 
     COMPLETED = "THANH_CONG"
     CANCELLED = "DA_HUY"
-    REFUNDED = "DA_HOAN_TIEN"    # Trạng thái mới
+    REFUNDED = "DA_HOAN_TIEN"    
 
 # ==========================================================
 #                      DATABASE ARCHITECTURE
@@ -288,12 +288,28 @@ async def cmd_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(f"❌ Trạng thái đơn không hợp lệ để rút tiền! (Hiện tại: {trade['status']})")
 
-# MỚI: LỆNH HOÀN TIỀN
+# ĐÃ SỬA: LỆNH HOÀN TIỀN (YÊU CẦU LÝ DO & HÌNH ẢNH)
 async def cmd_hoantien(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        return await update.message.reply_text("❌ Cú pháp: <code>/hoantien [MãGD] [STK Hoàn Tiền]</code>", parse_mode=ParseMode.HTML)
+    # Kiểm tra xem người dùng có gửi kèm ảnh không
+    if not update.message.photo:
+        return await update.message.reply_text(
+            "❌ <b>Yêu cầu hoàn tiền thất bại!</b>\nBạn bắt buộc phải gửi hình ảnh làm bằng chứng tranh chấp.\n\n"
+            "📸 <b>Cách làm:</b> Gửi một bức ảnh bằng chứng và chèn vào phần *Caption* cú pháp sau:\n"
+            "<code>/hoantien [MãGD] [STK Nhận Tiền] [Lý do hoàn]</code>", 
+            parse_mode=ParseMode.HTML
+        )
     
-    code, info = context.args[0].upper(), " ".join(context.args[1:])
+    # Lấy caption thay vì text
+    caption = update.message.caption or ""
+    parts = caption.split()
+    
+    if len(parts) < 4:
+        return await update.message.reply_text("❌ Cú pháp caption không đúng!\nVí dụ: <code>/hoantien GD12345 0987654321 MBBank Người bán lừa đảo</code>", parse_mode=ParseMode.HTML)
+    
+    code = parts[1].upper()
+    info = parts[2]
+    reason = " ".join(parts[3:])
+    
     trade = db.get_trade(code)
     
     if not trade:
@@ -308,9 +324,32 @@ async def cmd_hoantien(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if trade['status'] in [Status.HOLDING, Status.BUYER_DONE, Status.PAYOUT_WAIT]:
         db.update_trade(code, status=Status.REFUND_WAIT, seller_bank_info=info)
-        kb = [[InlineKeyboardButton("🔄 XÁC NHẬN HOÀN TIỀN", callback_data=f"adminrefund_{code}")]]
-        await context.bot.send_message(CONFIG['admin_id'], f"🚨 <b>YÊU CẦU HOÀN TIỀN: {code}</b>\n💰 Số tiền hoàn: {trade['total_pay']:,} VND\n💳 STK Nhận: {info}\n👤 Buyer: {trade['buyer_name']}\n📂 Nhóm: {trade['group_name']}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
-        await update.message.reply_text("✅ <b>Đã gửi yêu cầu hoàn tiền!</b>\nAdmin sẽ kiểm tra và thực hiện hoàn tiền cho bạn.", parse_mode=ParseMode.HTML)
+        
+        # Bổ sung nút Từ Chối Hoàn Tiền cho Admin
+        kb = [
+            [InlineKeyboardButton("🔄 DUYỆT HOÀN TIỀN", callback_data=f"adminrefund_{code}")],
+            [InlineKeyboardButton("❌ TỪ CHỐI & GIỮ TIỀN", callback_data=f"rejectrefund_{code}")]
+        ]
+        
+        admin_msg = f"""🚨 <b>YÊU CẦU HOÀN TIỀN CÓ TRANH CHẤP: {code}</b>
+━━━━━━━━━━━━━━━━━━━━
+💰 <b>Số tiền cần hoàn:</b> {trade['total_pay']:,} VND
+💳 <b>STK Nhận:</b> {info}
+📝 <b>Lý do khiếu nại:</b> {reason}
+👤 <b>Người khiếu nại:</b> {trade['buyer_name']}
+📂 <b>Nhóm GD:</b> {trade['group_name']}
+📸 <i>Bằng chứng được đính kèm bên trên.</i>"""
+        
+        # Gửi ảnh bằng chứng cho Admin
+        await context.bot.send_photo(
+            chat_id=CONFIG['admin_id'], 
+            photo=update.message.photo[-1].file_id, 
+            caption=admin_msg, 
+            parse_mode=ParseMode.HTML, 
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+        
+        await update.message.reply_text("✅ <b>Đã gửi yêu cầu hoàn tiền kèm bằng chứng!</b>\nAdmin sẽ xem xét hình ảnh và lý do để đưa ra quyết định.", parse_mode=ParseMode.HTML)
     else:
         await update.message.reply_text(f"❌ Trạng thái đơn không thể hoàn tiền! ({trade['status']})")
 
@@ -358,6 +397,37 @@ async def cmd_thongke(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💎 <b>Phí thu được:</b> {s['total_fee'] or 0:,} VND"""
     await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
 
+# TÍNH NĂNG MỚI: LỊCH SỬ GIAO DỊCH
+async def cmd_lichsu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    curr_user = f"@{update.effective_user.username}"
+    
+    with db.conn:
+        res = db.conn.execute(
+            "SELECT code, product_name, amount, status FROM trades WHERE buyer_id = ? OR seller_name = ? ORDER BY id DESC LIMIT 5", 
+            (user_id, curr_user)
+        ).fetchall()
+    
+    if not res:
+        return await update.message.reply_text("📭 Bạn chưa có giao dịch nào gần đây trên hệ thống.")
+        
+    txt = "<b>🕒 5 GIAO DỊCH GẦN NHẤT CỦA BẠN:</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+    for r in res:
+        txt += f"🔸 <b>{r['code']}</b> | {r['product_name']}\n💵 {r['amount']:,} VND - 📌 <code>{r['status']}</code>\n\n"
+    
+    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+
+# TÍNH NĂNG MỚI: LIÊN HỆ CSKH
+async def cmd_cskh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = f"""🎧 <b>HỖ TRỢ KHÁCH HÀNG 24/7</b>
+━━━━━━━━━━━━━━━━━━━━
+Nếu bạn gặp vấn đề với giao dịch, nạp sai tiền, hoặc có khiếu nại tranh chấp, vui lòng liên hệ Admin qua kênh sau:
+
+👨‍💻 <b>Admin:</b> {CONFIG['admin_handle']}
+
+<i>Lưu ý: Để được hỗ trợ nhanh nhất, vui lòng cung cấp kèm [Mã GD] và [Hình ảnh bill/bằng chứng] khi nhắn tin cho Admin.</i>"""
+    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
@@ -372,7 +442,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 3️⃣ <b>Giao hàng:</b> Bot nhận tiền -> Báo người bán giao hàng.
 4️⃣ <b>Xác nhận:</b> Người mua nhận xong bấm <b>[Đã nhận hàng]</b>.
 5️⃣ <b>Rút tiền:</b> Người bán dùng <code>/bank</code> để nhận tiền về STK.
-🆘 <b>Hoàn tiền:</b> Nếu có tranh chấp dùng <code>/hoantien</code>."""
+🆘 <b>Hoàn tiền:</b> Nếu có tranh chấp gửi ảnh kèm cap <code>/hoantien</code>."""
         await query.edit_message_text(txt, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Quay Lại", callback_data="ui_back")]]))
 
     elif data == "ui_back":
@@ -412,16 +482,56 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.answer("⚠️ Trạng thái đơn không hợp lệ!", show_alert=True)
 
+    # ĐÃ SỬA: CHỈ DÀNH CHO DUYỆT RÚT TIỀN CỦA SELLER
     elif data.startswith("adminpayout_"):
-        if user_id != CONFIG['admin_id']: return
+        if user_id != CONFIG['admin_id']: return await query.answer("⛔ Bạn không có quyền!", show_alert=True)
         code = data.split("_")[1]
         trade = db.get_trade(code)
         if trade['status'] == Status.PAYOUT_WAIT:
             db.update_trade(code, status=Status.COMPLETED)
-            await query.edit_message_text(f"✅ Đã hoàn tiền thành công đơn {code}")
-            await context.bot.send_message(trade['group_id'], f"<b>↩️ HOÀN TIỀN: Giao dịch {code} đã được hoàn tiền cho người mua.</b>\nTrạng thái: Đã kết thúc.", parse_mode=ParseMode.HTML)
+            await query.answer("✅ Đã đánh dấu hoàn tất rút tiền!")
+            
+            txt_admin = f"✅ <b>ĐÃ GIẢI NGÂN THÀNH CÔNG ĐƠN {code}</b> cho người bán."
+            if query.message.photo: await query.edit_message_caption(caption=txt_admin, parse_mode=ParseMode.HTML)
+            else: await query.edit_message_text(text=txt_admin, parse_mode=ParseMode.HTML)
+            
+            await context.bot.send_message(trade['group_id'], f"<b>✅ GIẢI NGÂN THÀNH CÔNG: Giao dịch {code}</b>\nAdmin đã chuyển tiền cho người bán {trade['seller_name']}. Cảm ơn các bạn đã sử dụng dịch vụ!", parse_mode=ParseMode.HTML)
         else:
-            await query.answer("⚠️ Đơn này không ở trạng thái chờ hoàn tiền!")
+            await query.answer("⚠️ Đơn không ở trạng thái chờ rút tiền!", show_alert=True)
+
+    # ĐÃ SỬA: CHỈ DÀNH CHO HOÀN TIỀN CỦA BUYER
+    elif data.startswith("adminrefund_"):
+        if user_id != CONFIG['admin_id']: return await query.answer("⛔ Bạn không có quyền!", show_alert=True)
+        code = data.split("_")[1]
+        trade = db.get_trade(code)
+        if trade['status'] == Status.REFUND_WAIT:
+            db.update_trade(code, status=Status.REFUNDED)
+            await query.answer("✅ Đã đánh dấu hoàn tiền cho người mua!")
+            
+            txt_admin = f"✅ <b>ĐÃ HOÀN TIỀN THÀNH CÔNG ĐƠN {code}</b> cho người mua."
+            if query.message.photo: await query.edit_message_caption(caption=txt_admin, parse_mode=ParseMode.HTML)
+            else: await query.edit_message_text(text=txt_admin, parse_mode=ParseMode.HTML)
+            
+            await context.bot.send_message(trade['group_id'], f"<b>↩️ HOÀN TIỀN THÀNH CÔNG: Giao dịch {code}</b>\nAdmin đã giải quyết khiếu nại và hoàn tiền cho người mua.\nTrạng thái: Đã kết thúc.", parse_mode=ParseMode.HTML)
+        else:
+            await query.answer("⚠️ Đơn này không ở trạng thái chờ hoàn tiền!", show_alert=True)
+
+    # TÍNH NĂNG MỚI: TỪ CHỐI HOÀN TIỀN
+    elif data.startswith("rejectrefund_"):
+        if user_id != CONFIG['admin_id']: return await query.answer("⛔ Bạn không có quyền!", show_alert=True)
+        code = data.split("_")[1]
+        trade = db.get_trade(code)
+        if trade['status'] == Status.REFUND_WAIT:
+            db.update_trade(code, status=Status.HOLDING) # Đưa trạng thái về lại đang giữ tiền
+            await query.answer("✅ Đã từ chối hoàn tiền!")
+            
+            txt_admin = f"❌ <b>ĐÃ TỪ CHỐI YÊU CẦU HOÀN TIỀN ĐƠN {code}</b>"
+            if query.message.photo: await query.edit_message_caption(caption=txt_admin, parse_mode=ParseMode.HTML)
+            else: await query.edit_message_text(text=txt_admin, parse_mode=ParseMode.HTML)
+            
+            await context.bot.send_message(trade['group_id'], f"<b>❌ TỪ CHỐI KHIẾU NẠI: Giao dịch {code}</b>\nAdmin đã xem xét bằng chứng và từ chối yêu cầu hoàn tiền. Tiền hiện vẫn đang được Bot giam giữ an toàn.", parse_mode=ParseMode.HTML)
+        else:
+            await query.answer("⚠️ Đơn này không ở trạng thái chờ hoàn tiền!", show_alert=True)
 
 # ==========================================================
 #                      RUNNER
@@ -431,10 +541,12 @@ async def main_runner():
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("taogdtg", cmd_taogdtg))
     tg_app.add_handler(CommandHandler("bank", cmd_bank))
-    tg_app.add_handler(CommandHandler("hoantien", cmd_hoantien)) # Thêm lệnh mới
+    tg_app.add_handler(CommandHandler("hoantien", cmd_hoantien)) 
     tg_app.add_handler(CommandHandler("check", cmd_check))
     tg_app.add_handler(CommandHandler("huy", cmd_huy))
     tg_app.add_handler(CommandHandler("thongke", cmd_thongke))
+    tg_app.add_handler(CommandHandler("lichsu", cmd_lichsu)) # Handler mới
+    tg_app.add_handler(CommandHandler("cskh", cmd_cskh))     # Handler mới
     tg_app.add_handler(CallbackQueryHandler(callback_handler))
     
     # Khởi tạo bot
